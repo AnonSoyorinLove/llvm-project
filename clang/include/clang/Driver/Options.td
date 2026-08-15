@@ -1590,6 +1590,12 @@ def static_libsan : Flag<["-"], "static-libsan">,
   HelpText<"Statically link the sanitizer runtime (Not supported for ASan, TSan or UBSan on darwin)">;
 def : Flag<["-"], "shared-libasan">, Alias<shared_libsan>;
 def fasm : Flag<["-"], "fasm">, Group<f_Group>;
+defm struct_layout_reloc : BoolFOption<"struct-layout-reloc",
+  CodeGenOpts<"StructLayoutReloc">, DefaultFalse,
+  PosFlag<SetTrue, [], [ClangOption, CC1Option],
+          "Emit patchable AArch64 struct field offsets and relocation metadata">,
+  NegFlag<SetFalse, [], [ClangOption, CC1Option],
+          "Disable struct layout relocation code generation">>;
 
 defm assume_unique_vtables : BoolFOption<"assume-unique-vtables",
   CodeGenOpts<"AssumeUniqueVTables">, DefaultTrue,

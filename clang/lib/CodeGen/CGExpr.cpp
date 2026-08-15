@@ -33,7 +33,9 @@
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/BinaryFormat/StructLayoutReloc.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsWebAssembly.h"
 #include "llvm/IR/LLVMContext.h"
@@ -44,6 +46,7 @@
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/SaveAndRestore.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
 #include "llvm/Transforms/Utils/SanitizerStats.h"
 
@@ -4751,6 +4754,89 @@ static Address emitAddrOfFieldStorage(CodeGenFunction &CGF, Address base,
   return CGF.Builder.CreateStructGEP(base, idx, field->getName());
 }
 
+static bool shouldEmitStructLayoutReloc(CodeGenFunction &CGF,
+                                        const FieldDecl *Field) {
+  if (!CGF.CGM.getCodeGenOpts().StructLayoutReloc ||
+      CGF.getLangOpts().CPlusPlus)
+    return false;
+
+  const llvm::Triple &Triple = CGF.CGM.getTarget().getTriple();
+  const RecordDecl *Record = Field->getParent();
+  return Triple.isAArch64() && Triple.isOSBinFormatELF() &&
+         !Record->isUnion() && Record->getIdentifier() &&
+         Field->getIdentifier() && !Field->getType()->isIncompleteType();
+}
+
+static Address emitStructLayoutRelocFieldStorage(CodeGenFunction &CGF,
+                                                 Address Base,
+                                                 const FieldDecl *Field) {
+  using namespace llvm::struct_layout_reloc;
+
+  const RecordDecl *Record = Field->getParent();
+  const ASTRecordLayout &Layout = CGF.getContext().getASTRecordLayout(Record);
+  const uint64_t CharWidth = CGF.getContext().getCharWidth();
+  const uint64_t FieldOffset =
+      Layout.getFieldOffset(Field->getFieldIndex()) / CharWidth;
+  const uint64_t RecordSize = Layout.getSize().getQuantity();
+  const uint64_t FieldSize =
+      CGF.getContext().getTypeSizeInChars(Field->getType()).getQuantity();
+
+  if (!llvm::isUInt<32>(FieldOffset) || !llvm::isUInt<32>(RecordSize) ||
+      !llvm::isUInt<32>(FieldSize))
+    return emitAddrOfFieldStorage(CGF, Base, Field);
+
+  llvm::Module &M = CGF.CGM.getModule();
+  llvm::NamedMDNode *Relocs =
+      M.getOrInsertNamedMetadata("llvm.struct.layout.reloc");
+  llvm::LLVMContext &Ctx = M.getContext();
+  Relocs->addOperand(llvm::MDNode::get(
+      Ctx, {llvm::MDString::get(Ctx, Record->getName()),
+            llvm::MDString::get(Ctx, Field->getName()),
+            llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                llvm::Type::getInt32Ty(Ctx), FieldOffset)),
+            llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                llvm::Type::getInt32Ty(Ctx), FieldSize))}));
+
+  const uint32_t Low = static_cast<uint32_t>(FieldOffset) & 0xffffU;
+  const uint32_t High = static_cast<uint32_t>(FieldOffset) >> 16;
+  std::string Asm;
+  llvm::raw_string_ostream OS(Asm);
+  OS << "1:\n\t"
+     << "movz ${0:x}, #" << Low << "\n\t"
+     << "movk ${0:x}, #" << High << ", lsl #16\n\t"
+     << ".pushsection .llvm_struct_reloc.str,\"MS\",@progbits,1\n\t"
+     << "2:\n\t.asciz \"" << Record->getName() << "\"\n\t"
+     << "3:\n\t.asciz \"" << Field->getName() << "\"\n\t"
+     << ".popsection\n\t"
+     << ".pushsection .llvm_struct_reloc,\"\",@progbits\n\t"
+     << ".balign 8\n\t"
+     << ".long " << RecordMagic << "\n\t"
+     << ".short " << CurrentVersion << "\n\t"
+     << ".short " << static_cast<uint16_t>(Kind::FieldOffsetCode) << "\n\t"
+     << ".short " << static_cast<uint16_t>(PatchKind::AArch64MovwU32) << "\n\t"
+     << ".short " << static_cast<uint16_t>(IsStruct) << "\n\t"
+     << ".long " << sizeof(RecordV1) << "\n\t"
+     << ".quad 1b\n\t"
+     << ".quad 2b\n\t"
+     << ".quad 3b\n\t"
+     << ".long " << RecordSize << "\n\t"
+     << ".long " << FieldOffset << "\n\t"
+     << ".long " << FieldSize << "\n\t"
+     << ".long " << Field->getFieldIndex() << "\n\t"
+     << ".long 2\n\t"
+     << ".long 0\n\t"
+     << ".popsection";
+
+  llvm::FunctionType *AsmTy =
+      llvm::FunctionType::get(CGF.Int64Ty, /*isVarArg=*/false);
+  llvm::InlineAsm *IA =
+      llvm::InlineAsm::get(AsmTy, OS.str(), "=&r", /*hasSideEffects=*/true);
+  llvm::Value *Offset = CGF.Builder.CreateCall(IA, {}, "struct.field.offset");
+
+  Base = Base.withElementType(CGF.Int8Ty);
+  return CGF.Builder.CreateGEP(CGF, Base, Offset, Field->getName());
+}
+
 static Address emitPreserveStructAccess(CodeGenFunction &CGF, LValue base,
                                         Address addr, const FieldDecl *field) {
   const RecordDecl *rec = field->getParent();
@@ -4914,12 +5000,18 @@ LValue CodeGenFunction::EmitLValueForField(LValue base,
       addr = addr.withElementType(CGM.getTypes().ConvertTypeForMem(FieldType));
   } else {
     if (!IsInPreservedAIRegion &&
-        (!getDebugInfo() || !rec->hasAttr<BPFPreserveAccessIndexAttr>()))
-      // For structs, we GEP to the field that the record layout suggests.
-      addr = emitAddrOfFieldStorage(*this, addr, field);
-    else
-      // Remember the original struct field index
+        (!getDebugInfo() || !rec->hasAttr<BPFPreserveAccessIndexAttr>())) {
+      // For structs, use a patchable byte offset when requested.
+      if (shouldEmitStructLayoutReloc(*this, field)) {
+        addr = emitStructLayoutRelocFieldStorage(*this, addr, field);
+        FieldTBAAInfo = TBAAAccessInfo::getMayAliasInfo();
+      } else {
+        addr = emitAddrOfFieldStorage(*this, addr, field);
+      }
+    } else {
+      // Remember the original struct field index.
       addr = emitPreserveStructAccess(*this, base, addr, field);
+    }
   }
 
   // If this is a reference field, load the reference right now.
