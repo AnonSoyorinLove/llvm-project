@@ -408,6 +408,8 @@ if __name__ == "__main__":
         # When invoked by cmake the arguments are the cmake target names of the
         # libraries, so we need to add .lib/.a to the end and maybe lib to the
         # start to get the filename. Also allow objects.
+        if lib == 'zstd::libzstd_static':
+            continue
         suffixes = [".lib", ".a", ".obj", ".o"]
         if not any([lib.endswith(s) for s in suffixes]):
             for s in suffixes:
