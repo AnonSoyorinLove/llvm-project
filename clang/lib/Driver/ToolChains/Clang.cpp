@@ -5700,6 +5700,7 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
                     options::OPT_fno_strict_vtable_pointers);
   Args.addOptInFlag(CmdArgs, options::OPT_fstruct_layout_reloc,
                     options::OPT_fno_struct_layout_reloc);
+  Args.AddLastArg(CmdArgs, options::OPT_fstruct_layout_reloc_global_reserve_EQ);
   Args.addOptInFlag(CmdArgs, options::OPT_fforce_emit_vtables,
                     options::OPT_fno_force_emit_vtables);
   Args.addOptOutFlag(CmdArgs, options::OPT_foptimize_sibling_calls,

@@ -5400,6 +5400,98 @@ static void emitStructLayoutRelocGlobalData(
   CGM.getModule().appendModuleInlineAsm(OS.str());
 }
 
+
+static void emitStructLayoutRelocGlobalRecord(
+    CodeGenModule &CGM, llvm::GlobalVariable *GV,
+    llvm::struct_layout_reloc::Kind RelocKind, const RecordDecl *Record,
+    llvm::StringRef FieldName, uint64_t CompiledTypeSize,
+    uint64_t CompiledFieldOffset, uint64_t CompiledFieldSize,
+    uint32_t FieldIndex) {
+  using namespace llvm::struct_layout_reloc;
+
+  if (!llvm::isUInt<32>(CompiledTypeSize) ||
+      !llvm::isUInt<32>(CompiledFieldOffset) ||
+      !llvm::isUInt<32>(CompiledFieldSize))
+    return;
+
+  std::string Asm;
+  llvm::raw_string_ostream OS(Asm);
+  OS << ".pushsection .llvm_struct_reloc.str,\"MS\",@progbits,1\n\t"
+     << "2:\n\t.asciz \"" << Record->getName() << "\"\n\t"
+     << "3:\n\t.asciz \"" << FieldName << "\"\n\t"
+     << ".popsection\n\t"
+     << ".pushsection .llvm_struct_reloc,\"\",@progbits\n\t"
+     << ".balign 8\n\t"
+     << ".long " << RecordMagic << "\n\t"
+     << ".short " << CurrentVersion << "\n\t"
+     << ".short " << static_cast<uint16_t>(RelocKind) << "\n\t"
+     << ".short " << static_cast<uint16_t>(PatchKind::None) << "\n\t"
+     << ".short " << static_cast<uint16_t>(IsStruct) << "\n\t"
+     << ".long " << sizeof(RecordV1) << "\n\t"
+     << ".quad " << GV->getName() << "\n\t"
+     << ".quad 2b\n\t"
+     << ".quad 3b\n\t"
+     << ".long " << CompiledTypeSize << "\n\t"
+     << ".long " << CompiledFieldOffset << "\n\t"
+     << ".long " << CompiledFieldSize << "\n\t"
+     << ".long " << FieldIndex << "\n\t"
+     << ".long 0\n\t"
+     << ".long 0\n\t"
+     << ".popsection";
+  CGM.getModule().appendModuleInlineAsm(OS.str());
+}
+
+static bool isStructLayoutRelocGlobalDecl(CodeGenModule &CGM,
+                                           const VarDecl *D,
+                                           const RecordDecl **RecordOut) {
+  if (!D || !D->isFileVarDecl() || D->getTLSKind())
+    return false;
+  return isStructLayoutRelocGlobalType(CGM, D->getType(), RecordOut);
+}
+
+static llvm::Constant *extendStructLayoutRelocGlobalInitializer(
+    CodeGenModule &CGM, llvm::Constant *Init,
+    const RecordDecl *Record, uint64_t &CompiledSize, uint64_t &ReserveSize) {
+  llvm::Type *InitType = Init->getType();
+  CompiledSize = CGM.getDataLayout().getTypeAllocSize(InitType);
+  ReserveSize = std::max<uint64_t>(
+      CompiledSize, CGM.getCodeGenOpts().StructLayoutRelocGlobalReserve);
+  if (ReserveSize == CompiledSize)
+    return Init;
+
+  llvm::LLVMContext &Ctx = CGM.getLLVMContext();
+  llvm::ArrayType *TailType = llvm::ArrayType::get(
+      llvm::Type::getInt8Ty(Ctx), ReserveSize - CompiledSize);
+  llvm::StructType *ExtendedType = llvm::StructType::create(
+      Ctx, {InitType, TailType}, Record->getName().str() + ".reloc");
+  return llvm::ConstantStruct::get(
+      ExtendedType, {Init, llvm::ConstantAggregateZero::get(TailType)});
+}
+
+static void maybeEmitStructLayoutRelocGlobalObject(
+    CodeGenModule &CGM, llvm::GlobalVariable *GV,
+    const RecordDecl *Record, uint64_t CompiledSize, uint64_t ReserveSize) {
+  if (!GV || !Record || !CGM.getCodeGenOpts().StructLayoutReloc)
+    return;
+
+  emitStructLayoutRelocGlobalRecord(
+      CGM, GV, llvm::struct_layout_reloc::Kind::GlobalObjectLayout, Record,
+      "<object>", CompiledSize, ReserveSize, 0, 0);
+
+  const ASTRecordLayout &Layout = CGM.getContext().getASTRecordLayout(Record);
+  for (const FieldDecl *Field : Record->fields()) {
+    if (!Field->getIdentifier() || Field->isBitField())
+      continue;
+    uint64_t Offset = Layout.getFieldOffset(Field->getFieldIndex()) /
+                      CGM.getContext().getCharWidth();
+    uint64_t Size = CGM.getContext().getTypeSizeInChars(Field->getType())
+                        .getQuantity();
+    emitStructLayoutRelocGlobalRecord(
+        CGM, GV, llvm::struct_layout_reloc::Kind::GlobalInitField, Record,
+        Field->getName(), CompiledSize, Offset, Size, Field->getFieldIndex());
+  }
+}
+
 static void maybeEmitStructLayoutRelocGlobalData(CodeGenModule &CGM,
                                                  llvm::GlobalVariable *GV,
                                                  const Expr *InitExpr) {
@@ -5550,6 +5642,14 @@ void CodeGenModule::EmitGlobalVarDefinition(const VarDecl *D,
     }
   }
 
+  const RecordDecl *RelocGlobalRecord = nullptr;
+  uint64_t RelocGlobalCompiledSize = 0;
+  uint64_t RelocGlobalReserveSize = 0;
+  if (isStructLayoutRelocGlobalDecl(*this, D, &RelocGlobalRecord))
+    Init = extendStructLayoutRelocGlobalInitializer(
+        *this, Init, RelocGlobalRecord, RelocGlobalCompiledSize,
+        RelocGlobalReserveSize);
+
   llvm::Type* InitType = Init->getType();
   llvm::Constant *Entry =
       GetAddrOfGlobalVar(D, InitType, ForDefinition_t(!IsTentative));
@@ -5620,6 +5720,9 @@ void CodeGenModule::EmitGlobalVarDefinition(const VarDecl *D,
   }
 
   GV->setInitializer(Init);
+  maybeEmitStructLayoutRelocGlobalObject(
+      *this, GV, RelocGlobalRecord, RelocGlobalCompiledSize,
+      RelocGlobalReserveSize);
   maybeEmitStructLayoutRelocGlobalData(*this, GV, InitExpr);
   if (emitter)
     emitter->finalize(GV);

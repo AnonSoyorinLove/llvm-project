@@ -23,9 +23,12 @@ enum class Kind : uint16_t {
   TypeSizeCode = 2,
   FieldOffsetData = 3,
   TypeSizeData = 4,
+  GlobalObjectLayout = 5,
+  GlobalInitField = 6,
 };
 
 enum class PatchKind : uint16_t {
+  None = 0,
   AArch64MovwU32 = 1,
   AArch64DataU32 = 2,
   AArch64DataU64 = 3,

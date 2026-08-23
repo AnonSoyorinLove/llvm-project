@@ -1597,6 +1597,12 @@ defm struct_layout_reloc : BoolFOption<"struct-layout-reloc",
   NegFlag<SetFalse, [], [ClangOption, CC1Option],
           "Disable struct layout relocation code generation">>;
 
+def fstruct_layout_reloc_global_reserve_EQ : Joined<["-"], "fstruct-layout-reloc-global-reserve=">,
+  Group<f_Group>, Visibility<[ClangOption, CC1Option]>,
+  MetaVarName<"<bytes>">,
+  HelpText<"Reserve bytes for relocatable file-scope struct objects">,
+  MarshallingInfoInt<CodeGenOpts<"StructLayoutRelocGlobalReserve">, "0">;
+
 defm assume_unique_vtables : BoolFOption<"assume-unique-vtables",
   CodeGenOpts<"AssumeUniqueVTables">, DefaultTrue,
   PosFlag<SetTrue>,
