@@ -3975,6 +3975,32 @@ static CharUnits getArrayElementAlign(CharUnits arrayAlign,
   }
 }
 
+static Address emitStructLayoutRelocArrayElement(CodeGenFunction &CGF,
+                                                 Address Base,
+                                                 llvm::Value *Index,
+                                                 QualType ElementType,
+                                                 bool InBounds,
+                                                 bool SignedIndices,
+                                                 SourceLocation Loc) {
+  llvm::Value *ElementSize =
+      CGF.EmitStructLayoutRelocObjectSize(ElementType);
+  if (!ElementSize)
+    return Address::invalid();
+
+  if (Index->getType() != CGF.IntPtrTy)
+    Index = CGF.Builder.CreateIntCast(Index, CGF.IntPtrTy,
+                                      SignedIndices, "reloc.idxprom");
+  if (ElementSize->getType() != CGF.IntPtrTy)
+    ElementSize = CGF.Builder.CreateIntCast(ElementSize, CGF.IntPtrTy,
+                                            false, "reloc.sizeprom");
+  llvm::Value *ScaledIndex =
+      CGF.Builder.CreateMul(Index, ElementSize, "struct.layout.reloc.stride");
+  llvm::Value *Ptr = emitArraySubscriptGEP(
+      CGF, CGF.Int8Ty, Base.emitRawPointer(CGF), ScaledIndex, InBounds,
+      SignedIndices, Loc, "struct.layout.reloc.arrayidx");
+  return Address(Ptr, CGF.ConvertTypeForMem(ElementType), CharUnits::One());
+}
+
 static QualType getFixedSizeElementType(const ASTContext &ctx,
                                         const VariableArrayType *vla) {
   QualType eltType;
@@ -4322,10 +4348,16 @@ LValue CodeGenFunction::EmitArraySubscriptExpr(const ArraySubscriptExpr *E,
 
     // Propagate the alignment from the array itself to the result.
     QualType arrayType = Array->getType();
-    Addr = emitArraySubscriptGEP(
-        *this, ArrayLV.getAddress(*this), {CGM.getSize(CharUnits::Zero()), Idx},
-        E->getType(), !getLangOpts().isSignedOverflowDefined(), SignedIndices,
-        E->getExprLoc(), &arrayType, E->getBase());
+    Addr = emitStructLayoutRelocArrayElement(
+        *this, ArrayLV.getAddress(*this), Idx, E->getType(),
+        !getLangOpts().isSignedOverflowDefined(), SignedIndices,
+        E->getExprLoc());
+    if (!Addr.isValid())
+      Addr = emitArraySubscriptGEP(
+          *this, ArrayLV.getAddress(*this),
+          {CGM.getSize(CharUnits::Zero()), Idx}, E->getType(),
+          !getLangOpts().isSignedOverflowDefined(), SignedIndices,
+          E->getExprLoc(), &arrayType, E->getBase());
     EltBaseInfo = ArrayLV.getBaseInfo();
     EltTBAAInfo = CGM.getTBAAInfoForSubobject(ArrayLV, E->getType());
   } else {
@@ -4333,10 +4365,17 @@ LValue CodeGenFunction::EmitArraySubscriptExpr(const ArraySubscriptExpr *E,
     Addr = EmitPointerWithAlignment(E->getBase(), &EltBaseInfo, &EltTBAAInfo);
     auto *Idx = EmitIdxAfterBase(/*Promote*/true);
     QualType ptrType = E->getBase()->getType();
-    Addr = emitArraySubscriptGEP(*this, Addr, Idx, E->getType(),
-                                 !getLangOpts().isSignedOverflowDefined(),
-                                 SignedIndices, E->getExprLoc(), &ptrType,
-                                 E->getBase());
+    Address RelocAddr = emitStructLayoutRelocArrayElement(
+        *this, Addr, Idx, E->getType(),
+        !getLangOpts().isSignedOverflowDefined(), SignedIndices,
+        E->getExprLoc());
+    if (RelocAddr.isValid())
+      Addr = RelocAddr;
+    else
+      Addr = emitArraySubscriptGEP(
+          *this, Addr, Idx, E->getType(),
+          !getLangOpts().isSignedOverflowDefined(), SignedIndices,
+          E->getExprLoc(), &ptrType, E->getBase());
   }
 
   LValue LV = MakeAddrLValue(Addr, E->getType(), EltBaseInfo, EltTBAAInfo);

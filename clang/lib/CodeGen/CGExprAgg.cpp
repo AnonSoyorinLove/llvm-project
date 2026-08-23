@@ -516,6 +516,8 @@ void AggExprEmitter::EmitArrayInit(Address DestPtr, llvm::ArrayType *AType,
 
   QualType elementType =
       CGF.getContext().getAsArrayType(ArrayQTy)->getElementType();
+  llvm::Value *RelocElementSize =
+      CGF.EmitStructLayoutRelocObjectSize(elementType);
 
   // DestPtr is an array*.  Construct an elementType* by drilling
   // down a level.
@@ -527,13 +529,15 @@ void AggExprEmitter::EmitArrayInit(Address DestPtr, llvm::ArrayType *AType,
 
   CharUnits elementSize = CGF.getContext().getTypeSizeInChars(elementType);
   CharUnits elementAlign =
-    DestPtr.getAlignment().alignmentOfArrayElement(elementSize);
+      RelocElementSize
+          ? CharUnits::One()
+          : DestPtr.getAlignment().alignmentOfArrayElement(elementSize);
   llvm::Type *llvmElementType = CGF.ConvertTypeForMem(elementType);
 
   // Consider initializing the array by copying from a global. For this to be
   // more efficient than per-element initialization, the size of the elements
   // with explicit initializers should be large enough.
-  if (NumInitElements * elementSize.getQuantity() > 16 &&
+  if (!RelocElementSize && NumInitElements * elementSize.getQuantity() > 16 &&
       elementType.isTriviallyCopyableType(CGF.getContext())) {
     CodeGen::CodeGenModule &CGM = CGF.CGM;
     ConstantEmitter Emitter(CGF);
@@ -588,6 +592,15 @@ void AggExprEmitter::EmitArrayInit(Address DestPtr, llvm::ArrayType *AType,
 
   llvm::Value *one = llvm::ConstantInt::get(CGF.SizeTy, 1);
 
+  auto EmitElementGEP = [&](llvm::Value *Ptr, llvm::Value *Index,
+                            const llvm::Twine &Name) {
+    if (!RelocElementSize)
+      return Builder.CreateInBoundsGEP(llvmElementType, Ptr, Index, Name);
+    llvm::Value *Offset =
+        Builder.CreateMul(Index, RelocElementSize, Name + ".offset");
+    return Builder.CreateInBoundsGEP(CGF.Int8Ty, Ptr, Offset, Name);
+  };
+
   // The 'current element to initialize'.  The invariants on this
   // variable are complicated.  Essentially, after each iteration of
   // the loop, it points to the last initialized element, except
@@ -599,8 +612,7 @@ void AggExprEmitter::EmitArrayInit(Address DestPtr, llvm::ArrayType *AType,
   for (uint64_t i = 0; i != NumInitElements; ++i) {
     // Advance to the next element.
     if (i > 0) {
-      element = Builder.CreateInBoundsGEP(
-          llvmElementType, element, one, "arrayinit.element");
+      element = EmitElementGEP(element, one, "arrayinit.element");
 
       // Tell the cleanup that it needs to destroy up to this
       // element.  TODO: some of these stores can be trivially
@@ -628,15 +640,14 @@ void AggExprEmitter::EmitArrayInit(Address DestPtr, llvm::ArrayType *AType,
 
     // Advance to the start of the rest of the array.
     if (NumInitElements) {
-      element = Builder.CreateInBoundsGEP(
-          llvmElementType, element, one, "arrayinit.start");
+      element = EmitElementGEP(element, one, "arrayinit.start");
       if (endOfInit.isValid()) Builder.CreateStore(element, endOfInit);
     }
 
     // Compute the end of the array.
-    llvm::Value *end = Builder.CreateInBoundsGEP(
-        llvmElementType, begin,
-        llvm::ConstantInt::get(CGF.SizeTy, NumArrayElements), "arrayinit.end");
+    llvm::Value *end = EmitElementGEP(
+        begin, llvm::ConstantInt::get(CGF.SizeTy, NumArrayElements),
+        "arrayinit.end");
 
     llvm::BasicBlock *entryBB = Builder.GetInsertBlock();
     llvm::BasicBlock *bodyBB = CGF.createBasicBlock("arrayinit.body");
@@ -664,8 +675,8 @@ void AggExprEmitter::EmitArrayInit(Address DestPtr, llvm::ArrayType *AType,
     }
 
     // Move on to the next element.
-    llvm::Value *nextElement = Builder.CreateInBoundsGEP(
-        llvmElementType, currentElement, one, "arrayinit.next");
+    llvm::Value *nextElement =
+        EmitElementGEP(currentElement, one, "arrayinit.next");
 
     // Tell the EH cleanup that we finished with the last element.
     if (endOfInit.isValid()) Builder.CreateStore(nextElement, endOfInit);
@@ -1604,6 +1615,14 @@ void AggExprEmitter::EmitNullInitializationToLValue(LValue lv) {
   if (Dest.isZeroed() && CGF.getTypes().isZeroInitializable(type))
     return;
 
+  if (llvm::Value *RelocSize = CGF.EmitStructLayoutRelocObjectSize(type)) {
+    CGF.Builder.CreateMemSet(
+        lv.getAddress(CGF).withElementType(CGF.CGM.Int8Ty),
+        llvm::ConstantInt::get(CGF.CGM.Int8Ty, 0), RelocSize,
+        lv.isVolatileQualified());
+    return;
+  }
+
   if (CGF.hasScalarEvaluationKind(type)) {
     // For non-aggregates, we can store the appropriate null constant.
     llvm::Value *null = CGF.CGM.EmitNullConstant(type);
@@ -2164,6 +2183,15 @@ void CodeGenFunction::EmitAggregateCopy(LValue Dest, LValue Src, QualType Ty,
   }
   if (!SizeVal) {
     SizeVal = llvm::ConstantInt::get(SizeTy, TypeInfo.Width.getQuantity());
+  }
+
+  if (Ty->isRecordType() || Ty->isConstantArrayType()) {
+    if (llvm::Value *RelocSize = EmitStructLayoutRelocObjectSize(Ty)) {
+      if (RelocSize->getType() != SizeTy)
+        RelocSize = Builder.CreateIntCast(RelocSize, SizeTy, false,
+                                          "struct.layout.reloc.copy.size");
+      SizeVal = RelocSize;
+    }
   }
 
   // FIXME: If we have a volatile struct, the optimizer can remove what might

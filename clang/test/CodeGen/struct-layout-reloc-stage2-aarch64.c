@@ -40,7 +40,7 @@ unsigned global_size32 = sizeof(struct sample);
 // IR: call i64 asm sideeffect
 // IR-SAME: movz ${0:x}, #16
 // IR: ret i64 %struct.layout.reloc.value
-// IR: !llvm.struct.layout.reloc = !{![[FIELD:[0-9]+]], ![[SIZE:[0-9]+]], ![[SIZE]], ![[GLOBAL_FIELD:[0-9]+]], ![[GLOBAL_SIZE:[0-9]+]], ![[GLOBAL_SIZE]]}
+// IR: !llvm.struct.layout.reloc = !{![[FIELD:[0-9]+]], ![[SIZE:[0-9]+]], ![[SIZE]], ![[FIELD]], ![[SIZE]], ![[SIZE]], ![[FIELD]], ![[SIZE]]}
 // IR: ![[FIELD]] = !{!"sample", !"value", i32 16, i32 4, i32 4}
 // IR: ![[SIZE]] = !{!"sample", !"<type-size>", i32 16, i32 0, i32 0}
 

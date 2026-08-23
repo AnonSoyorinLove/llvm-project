@@ -1059,6 +1059,32 @@ public:
 };
 }  // end anonymous namespace.
 
+llvm::Value *CodeGenFunction::EmitStructLayoutRelocTypeSize(QualType Type) {
+  return tryEmitStructLayoutRelocTypeSize(*this, Type);
+}
+
+llvm::Value *CodeGenFunction::EmitStructLayoutRelocObjectSize(QualType Type) {
+  QualType ElementType = Type;
+  uint64_t ElementCount = 1;
+  while (const auto *Array = getContext().getAsConstantArrayType(ElementType)) {
+    const llvm::APInt &ArrayCount = Array->getSize();
+    if (!ArrayCount.isIntN(64))
+      return nullptr;
+    uint64_t Count = ArrayCount.getZExtValue();
+    if (Count != 0 && ElementCount > UINT64_MAX / Count)
+      return nullptr;
+    ElementCount *= Count;
+    ElementType = Array->getElementType();
+  }
+
+  llvm::Value *Size = EmitStructLayoutRelocTypeSize(ElementType);
+  if (!Size || ElementCount == 1)
+    return Size;
+  llvm::Value *Count = llvm::ConstantInt::get(Size->getType(), ElementCount);
+  return Builder.CreateNUWMul(Size, Count, "struct.layout.reloc.object.size");
+}
+
+
 //===----------------------------------------------------------------------===//
 //                                Utilities
 //===----------------------------------------------------------------------===//
@@ -3047,8 +3073,24 @@ ScalarExprEmitter::EmitScalarPrePostIncDec(const UnaryOperator *E, LValue LV,
   } else if (const PointerType *ptr = type->getAs<PointerType>()) {
     QualType type = ptr->getPointeeType();
 
+    if (Value *RelocSize = CGF.EmitStructLayoutRelocTypeSize(type)) {
+      if (RelocSize->getType() != CGF.IntPtrTy)
+        RelocSize = CGF.Builder.CreateIntCast(
+            RelocSize, CGF.IntPtrTy, false, "reloc.inc.size.cast");
+      llvm::Value *Amount =
+          llvm::ConstantInt::get(CGF.IntPtrTy, isInc ? 1 : -1, true);
+      llvm::Value *ScaledAmount =
+          Builder.CreateMul(Amount, RelocSize, "reloc.inc.offset");
+      if (CGF.getLangOpts().isSignedOverflowDefined())
+        value = Builder.CreateGEP(CGF.Int8Ty, value, ScaledAmount,
+                                  "incdec.ptr");
+      else
+        value = CGF.EmitCheckedInBoundsGEP(
+            CGF.Int8Ty, value, ScaledAmount, /*SignedIndices=*/true,
+            isSubtraction, E->getExprLoc(), "incdec.ptr");
+
     // VLA types don't have constant size.
-    if (const VariableArrayType *vla
+    } else if (const VariableArrayType *vla
           = CGF.getContext().getAsVariableArrayType(type)) {
       llvm::Value *numElts = CGF.getVLASize(vla).NumElts;
       if (!isInc) numElts = Builder.CreateNSWNeg(numElts, "vla.negsize");
@@ -3441,7 +3483,7 @@ ScalarExprEmitter::VisitUnaryExprOrTypeTraitExpr(
     }
 
     if (llvm::Value *RelocValue =
-            tryEmitStructLayoutRelocTypeSize(CGF, TypeToSize))
+            CGF.EmitStructLayoutRelocObjectSize(TypeToSize))
       return RelocValue;
   } else if (E->getKind() == UETT_OpenMPRequiredSimdAlign) {
     auto Alignment =
@@ -4063,8 +4105,8 @@ static Value *emitPointerArithmetic(CodeGenFunction &CGF,
     CGF.EmitBoundsCheck(op.E, pointerOperand, index, indexOperand->getType(),
                         /*Accessed*/ false);
 
-  const PointerType *pointerType
-    = pointerOperand->getType()->getAs<PointerType>();
+  const PointerType *pointerType =
+      pointerOperand->getType()->getAs<PointerType>();
   if (!pointerType) {
     QualType objectType = pointerOperand->getType()
                                         ->castAs<ObjCObjectPointerType>()
@@ -4080,6 +4122,21 @@ static Value *emitPointerArithmetic(CodeGenFunction &CGF,
   }
 
   QualType elementType = pointerType->getPointeeType();
+  if (Value *RelocSize = CGF.EmitStructLayoutRelocTypeSize(elementType)) {
+    if (RelocSize->getType() != index->getType())
+      RelocSize = CGF.Builder.CreateIntCast(
+          RelocSize, index->getType(), false, "reloc.stride.cast");
+    if (CGF.getLangOpts().isSignedOverflowDefined())
+      index = CGF.Builder.CreateMul(index, RelocSize, "reloc.index");
+    else
+      index = CGF.Builder.CreateNSWMul(index, RelocSize, "reloc.index");
+    if (CGF.getLangOpts().isSignedOverflowDefined())
+      return CGF.Builder.CreateGEP(CGF.Int8Ty, pointer, index, "add.ptr");
+    return CGF.EmitCheckedInBoundsGEP(
+        CGF.Int8Ty, pointer, index, isSigned, isSubtraction,
+        op.E->getExprLoc(), "add.ptr");
+  }
+
   if (const VariableArrayType *vla
         = CGF.getContext().getAsVariableArrayType(elementType)) {
     // The element count here is the total number of non-VLA elements.
@@ -4468,8 +4525,15 @@ Value *ScalarExprEmitter::EmitSub(const BinOpInfo &op) {
 
   llvm::Value *divisor = nullptr;
 
+  // For a relocatable struct, use the patched runtime size as the divisor.
+  if (Value *RelocSize = CGF.EmitStructLayoutRelocTypeSize(elementType)) {
+    if (RelocSize->getType() != CGF.PtrDiffTy)
+      RelocSize = CGF.Builder.CreateIntCast(
+          RelocSize, CGF.PtrDiffTy, false, "reloc.divisor.cast");
+    divisor = RelocSize;
+
   // For a variable-length array, this is going to be non-constant.
-  if (const VariableArrayType *vla
+  } else if (const VariableArrayType *vla
         = CGF.getContext().getAsVariableArrayType(elementType)) {
     auto VlaSize = CGF.getVLASize(vla);
     elementType = VlaSize.Type;

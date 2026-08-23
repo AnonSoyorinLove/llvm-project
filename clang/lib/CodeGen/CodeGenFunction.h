@@ -2913,6 +2913,10 @@ public:
   void EmitExprAsInit(const Expr *init, const ValueDecl *D, LValue lvalue,
                       bool capturedByInit);
 
+  // Emit a relocatable struct type size for runtime allocation and copies.
+  llvm::Value *EmitStructLayoutRelocTypeSize(QualType Type);
+  llvm::Value *EmitStructLayoutRelocObjectSize(QualType Type);
+
   /// hasVolatileMember - returns true if aggregate type has a volatile
   /// member.
   bool hasVolatileMember(QualType T) {

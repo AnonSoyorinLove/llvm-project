@@ -1189,10 +1189,11 @@ static Address createUnnamedGlobalForMemcpyFrom(CodeGenModule &CGM,
   return SrcPtr.withElementType(CGM.Int8Ty);
 }
 
-static void emitStoresForConstant(CodeGenModule &CGM, const VarDecl &D,
+static void emitStoresForConstant(CodeGenFunction &CGF, const VarDecl &D,
                                   Address Loc, bool isVolatile,
                                   CGBuilderTy &Builder,
                                   llvm::Constant *constant, bool IsAutoInit) {
+  CodeGenModule &CGM = CGF.CGM;
   auto *Ty = constant->getType();
   uint64_t ConstantSize = CGM.getDataLayout().getTypeAllocSize(Ty);
   if (!ConstantSize)
@@ -1260,7 +1261,7 @@ static void emitStoresForConstant(CodeGenModule &CGM, const VarDecl &D,
               CharUnits::fromQuantity(Layout->getElementOffset(i));
           Address EltPtr = Builder.CreateConstInBoundsByteGEP(
               Loc.withElementType(CGM.Int8Ty), CurOff);
-          emitStoresForConstant(CGM, D, EltPtr, isVolatile, Builder,
+          emitStoresForConstant(CGF, D, EltPtr, isVolatile, Builder,
                                 constant->getAggregateElement(i), IsAutoInit);
         }
         return;
@@ -1271,7 +1272,7 @@ static void emitStoresForConstant(CodeGenModule &CGM, const VarDecl &D,
         for (unsigned i = 0; i != ATy->getNumElements(); i++) {
           Address EltPtr = Builder.CreateConstGEP(
               Loc.withElementType(ATy->getElementType()), i);
-          emitStoresForConstant(CGM, D, EltPtr, isVolatile, Builder,
+          emitStoresForConstant(CGF, D, EltPtr, isVolatile, Builder,
                                 constant->getAggregateElement(i), IsAutoInit);
         }
         return;
@@ -1289,24 +1290,43 @@ static void emitStoresForConstant(CodeGenModule &CGM, const VarDecl &D,
     I->addAnnotationMetadata("auto-init");
 }
 
-static void emitStoresForZeroInit(CodeGenModule &CGM, const VarDecl &D,
-                                  Address Loc, bool isVolatile,
+static void emitStoresForZeroInit(CodeGenFunction &CGF, const VarDecl &D,
+                                  QualType Type, Address Loc, bool isVolatile,
                                   CGBuilderTy &Builder) {
+  CodeGenModule &CGM = CGF.CGM;
   llvm::Type *ElTy = Loc.getElementType();
+  if (llvm::Value *RelocSize = CGF.EmitStructLayoutRelocObjectSize(Type)) {
+    auto *I = Builder.CreateMemSet(Loc.withElementType(CGM.Int8Ty),
+                                   llvm::ConstantInt::get(CGM.Int8Ty, 0),
+                                   RelocSize, isVolatile);
+    I->addAnnotationMetadata("auto-init");
+    return;
+  }
   llvm::Constant *constant =
       constWithPadding(CGM, IsPattern::No, llvm::Constant::getNullValue(ElTy));
-  emitStoresForConstant(CGM, D, Loc, isVolatile, Builder, constant,
+  emitStoresForConstant(CGF, D, Loc, isVolatile, Builder, constant,
                         /*IsAutoInit=*/true);
 }
 
-static void emitStoresForPatternInit(CodeGenModule &CGM, const VarDecl &D,
-                                     Address Loc, bool isVolatile,
+static void emitStoresForPatternInit(CodeGenFunction &CGF, const VarDecl &D,
+                                     QualType Type, Address Loc, bool isVolatile,
                                      CGBuilderTy &Builder) {
+  CodeGenModule &CGM = CGF.CGM;
   llvm::Type *ElTy = Loc.getElementType();
+  if (llvm::Value *RelocSize = CGF.EmitStructLayoutRelocObjectSize(Type)) {
+    llvm::Constant *BytePattern = initializationPatternFor(CGM, CGM.Int8Ty);
+    auto *Byte = dyn_cast<llvm::ConstantInt>(BytePattern);
+    if (!Byte)
+      return;
+    auto *I = Builder.CreateMemSet(Loc.withElementType(CGM.Int8Ty), Byte,
+                                   RelocSize, isVolatile);
+    I->addAnnotationMetadata("auto-init");
+    return;
+  }
   llvm::Constant *constant = constWithPadding(
       CGM, IsPattern::Yes, initializationPatternFor(CGM, ElTy));
   assert(!isa<llvm::UndefValue>(constant));
-  emitStoresForConstant(CGM, D, Loc, isVolatile, Builder, constant,
+  emitStoresForConstant(CGF, D, Loc, isVolatile, Builder, constant,
                         /*IsAutoInit=*/true);
 }
 
@@ -1562,6 +1582,28 @@ CodeGenFunction::EmitAutoVarAlloca(const VarDecl &D) {
         allocaAlignment = alignment;
       }
 
+      llvm::Value *RelocObjectSize = nullptr;
+      if (!isEscapingByRef && !NRVO &&
+          (Ty->isRecordType() || Ty->isConstantArrayType()))
+        RelocObjectSize = EmitStructLayoutRelocObjectSize(Ty);
+
+      if (RelocObjectSize) {
+        if (!DidCallStackSave) {
+          Address Stack =
+              CreateDefaultAlignTempAlloca(AllocaInt8PtrTy, "saved_stack");
+          llvm::Value *V = Builder.CreateStackSave();
+          assert(V->getType() == AllocaInt8PtrTy);
+          Builder.CreateStore(V, Stack);
+          DidCallStackSave = true;
+          pushStackRestore(NormalCleanup, Stack);
+        }
+
+        RawAddress Raw = CreateTempAlloca(Int8Ty, allocaAlignment, D.getName(),
+                                          RelocObjectSize, &AllocaAddr);
+        address = Address(Raw.getPointer(), allocaTy, allocaAlignment,
+                          KnownNonNull);
+      } else {
+
       // Create the alloca.  Note that we set the name separately from
       // building the instruction so that it's there even in no-asserts
       // builds.
@@ -1598,6 +1640,7 @@ CodeGenFunction::EmitAutoVarAlloca(const VarDecl &D) {
         }
       } else {
         assert(!emission.useLifetimeMarkers());
+      }
       }
     }
   } else {
@@ -1796,7 +1839,7 @@ void CodeGenFunction::emitZeroOrPatternForAutoVarInit(QualType type,
       if (trivialAutoVarInitMaxSize > 0 &&
           allocSize > trivialAutoVarInitMaxSize)
         return;
-      emitStoresForZeroInit(CGM, D, Loc, isVolatile, Builder);
+      emitStoresForZeroInit(*this, D, type, Loc, isVolatile, Builder);
       break;
     case LangOptions::TrivialAutoVarInitKind::Pattern:
       if (CGM.stopAutoInit())
@@ -1804,7 +1847,7 @@ void CodeGenFunction::emitZeroOrPatternForAutoVarInit(QualType type,
       if (trivialAutoVarInitMaxSize > 0 &&
           allocSize > trivialAutoVarInitMaxSize)
         return;
-      emitStoresForPatternInit(CGM, D, Loc, isVolatile, Builder);
+      emitStoresForPatternInit(*this, D, type, Loc, isVolatile, Builder);
       break;
     }
     return;
@@ -1987,7 +2030,19 @@ void CodeGenFunction::EmitAutoVarInit(const AutoVarEmission &emission) {
     return EmitStoreThroughLValue(RValue::get(constant), lv, true);
   }
 
-  emitStoresForConstant(CGM, D, Loc.withElementType(CGM.Int8Ty),
+  if (llvm::Value *RelocSize = EmitStructLayoutRelocObjectSize(type)) {
+    if (constant->isZeroValue()) {
+      Builder.CreateMemSet(Loc.withElementType(CGM.Int8Ty),
+                           llvm::ConstantInt::get(CGM.Int8Ty, 0), RelocSize,
+                           type.isVolatileQualified());
+      return;
+    }
+    LValue lv = MakeAddrLValue(Loc, type);
+    lv.setNonGC(true);
+    return EmitExprAsInit(Init, &D, lv, capturedByInit);
+  }
+
+  emitStoresForConstant(*this, D, Loc.withElementType(CGM.Int8Ty),
                         type.isVolatileQualified(), Builder, constant,
                         /*IsAutoInit=*/false);
 }
