@@ -4793,6 +4793,8 @@ static Address emitStructLayoutRelocFieldStorage(CodeGenFunction &CGF,
       Ctx, {llvm::MDString::get(Ctx, Record->getName()),
             llvm::MDString::get(Ctx, Field->getName()),
             llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                llvm::Type::getInt32Ty(Ctx), RecordSize)),
+            llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
                 llvm::Type::getInt32Ty(Ctx), FieldOffset)),
             llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
                 llvm::Type::getInt32Ty(Ctx), FieldSize))}));

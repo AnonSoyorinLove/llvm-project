@@ -29,6 +29,7 @@
 #include "clang/Basic/CodeGenOptions.h"
 #include "clang/Basic/TargetInfo.h"
 #include "llvm/ADT/APFixedPoint.h"
+#include "llvm/BinaryFormat/StructLayoutReloc.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
@@ -41,9 +42,12 @@
 #include "llvm/IR/IntrinsicsPowerPC.h"
 #include "llvm/IR/MatrixBuilder.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/Support/TypeSize.h"
+#include "llvm/Support/raw_ostream.h"
 #include <cstdarg>
 #include <optional>
+#include <string>
 
 using namespace clang;
 using namespace CodeGen;
@@ -64,6 +68,134 @@ namespace {
 /// and signed BO_{Div,Rem}. For these opcodes, and for unsigned BO_{Div,Rem},
 /// the returned overflow check is precise. The returned value is 'true' for
 /// all other opcodes, to be conservative.
+bool shouldEmitStructLayoutRelocValue(CodeGenFunction &CGF,
+                                      QualType Type,
+                                      const RecordDecl **RecordOut) {
+  if (!CGF.CGM.getCodeGenOpts().StructLayoutReloc ||
+      CGF.getLangOpts().CPlusPlus)
+    return false;
+
+  const llvm::Triple &Triple = CGF.CGM.getTarget().getTriple();
+  const RecordType *RT = Type->getAs<RecordType>();
+  if (!Triple.isAArch64() || !Triple.isOSBinFormatELF() || !RT)
+    return false;
+
+  const RecordDecl *Record = RT->getDecl();
+  if (Record->isUnion() || !Record->getIdentifier() ||
+      Type->isIncompleteType())
+    return false;
+
+  if (RecordOut)
+    *RecordOut = Record;
+  return true;
+}
+
+llvm::Value *emitStructLayoutRelocValue(
+    CodeGenFunction &CGF, llvm::struct_layout_reloc::Kind RelocKind,
+    const RecordDecl *Record, llvm::StringRef FieldName,
+    uint64_t CompiledTypeSize, uint64_t CompiledFieldOffset,
+    uint64_t CompiledFieldSize, uint32_t FieldIndex) {
+  using namespace llvm::struct_layout_reloc;
+
+  if (!llvm::isUInt<32>(CompiledTypeSize) ||
+      !llvm::isUInt<32>(CompiledFieldOffset) ||
+      !llvm::isUInt<32>(CompiledFieldSize))
+    return nullptr;
+
+  llvm::Module &M = CGF.CGM.getModule();
+  llvm::NamedMDNode *Relocs =
+      M.getOrInsertNamedMetadata("llvm.struct.layout.reloc");
+  llvm::LLVMContext &Ctx = M.getContext();
+  Relocs->addOperand(llvm::MDNode::get(
+      Ctx, {llvm::MDString::get(Ctx, Record->getName()),
+            llvm::MDString::get(Ctx, FieldName),
+            llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                llvm::Type::getInt32Ty(Ctx), CompiledTypeSize)),
+            llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                llvm::Type::getInt32Ty(Ctx), CompiledFieldOffset)),
+            llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                llvm::Type::getInt32Ty(Ctx), CompiledFieldSize))}));
+
+  const uint32_t Value = RelocKind == Kind::TypeSizeCode
+                             ? static_cast<uint32_t>(CompiledTypeSize)
+                             : static_cast<uint32_t>(CompiledFieldOffset);
+  const uint32_t Low = Value & 0xffffU;
+  const uint32_t High = Value >> 16;
+  std::string Asm;
+  llvm::raw_string_ostream OS(Asm);
+  OS << "1:\n\t"
+     << "movz ${0:x}, #" << Low << "\n\t"
+     << "movk ${0:x}, #" << High << ", lsl #16\n\t"
+     << ".pushsection .llvm_struct_reloc.str,\"MS\",@progbits,1\n\t"
+     << "2:\n\t.asciz \"" << Record->getName() << "\"\n\t"
+     << "3:\n\t.asciz \"" << FieldName << "\"\n\t"
+     << ".popsection\n\t"
+     << ".pushsection .llvm_struct_reloc,\"\",@progbits\n\t"
+     << ".balign 8\n\t"
+     << ".long " << RecordMagic << "\n\t"
+     << ".short " << CurrentVersion << "\n\t"
+     << ".short " << static_cast<uint16_t>(RelocKind) << "\n\t"
+     << ".short " << static_cast<uint16_t>(PatchKind::AArch64MovwU32)
+     << "\n\t"
+     << ".short " << static_cast<uint16_t>(IsStruct) << "\n\t"
+     << ".long " << sizeof(RecordV1) << "\n\t"
+     << ".quad 1b\n\t"
+     << ".quad 2b\n\t"
+     << ".quad 3b\n\t"
+     << ".long " << CompiledTypeSize << "\n\t"
+     << ".long " << CompiledFieldOffset << "\n\t"
+     << ".long " << CompiledFieldSize << "\n\t"
+     << ".long " << FieldIndex << "\n\t"
+     << ".long 2\n\t"
+     << ".long 0\n\t"
+     << ".popsection";
+
+  llvm::FunctionType *AsmTy =
+      llvm::FunctionType::get(CGF.Int64Ty, /*isVarArg=*/false);
+  llvm::InlineAsm *IA =
+      llvm::InlineAsm::get(AsmTy, OS.str(), "=&r", /*hasSideEffects=*/true);
+  return CGF.Builder.CreateCall(IA, {}, "struct.layout.reloc.value");
+}
+
+llvm::Value *tryEmitStructLayoutRelocOffsetOf(CodeGenFunction &CGF,
+                                               OffsetOfExpr *E) {
+  if (E->getNumComponents() != 1 ||
+      E->getComponent(0).getKind() != OffsetOfNode::Field)
+    return nullptr;
+
+  FieldDecl *Field = E->getComponent(0).getField();
+  const RecordDecl *Record = nullptr;
+  QualType Type = E->getTypeSourceInfo()->getType();
+  if (!shouldEmitStructLayoutRelocValue(CGF, Type, &Record) ||
+      Field->getParent() != Record)
+    return nullptr;
+
+  const ASTRecordLayout &Layout =
+      CGF.getContext().getASTRecordLayout(Record);
+  uint64_t Offset =
+      Layout.getFieldOffset(Field->getFieldIndex()) /
+      CGF.getContext().getCharWidth();
+  uint64_t TypeSize = Layout.getSize().getQuantity();
+  uint64_t FieldSize =
+      CGF.getContext().getTypeSizeInChars(Field->getType()).getQuantity();
+  return emitStructLayoutRelocValue(
+      CGF, llvm::struct_layout_reloc::Kind::FieldOffsetCode, Record,
+      Field->getName(), TypeSize, Offset, FieldSize, Field->getFieldIndex());
+}
+
+llvm::Value *tryEmitStructLayoutRelocTypeSize(CodeGenFunction &CGF,
+                                              QualType Type) {
+  const RecordDecl *Record = nullptr;
+  if (!shouldEmitStructLayoutRelocValue(CGF, Type, &Record))
+    return nullptr;
+
+  const ASTRecordLayout &Layout = CGF.getContext().getASTRecordLayout(Record);
+  uint64_t TypeSize = Layout.getSize().getQuantity();
+  return emitStructLayoutRelocValue(
+      CGF, llvm::struct_layout_reloc::Kind::TypeSizeCode, Record,
+      "<type-size>", TypeSize, 0, 0, 0);
+}
+
 bool mayHaveIntegerOverflow(llvm::ConstantInt *LHS, llvm::ConstantInt *RHS,
                              BinaryOperator::Opcode Opcode, bool Signed,
                              llvm::APInt &Result) {
@@ -3185,6 +3317,9 @@ Value *ScalarExprEmitter::VisitUnaryLNot(const UnaryOperator *E) {
 }
 
 Value *ScalarExprEmitter::VisitOffsetOfExpr(OffsetOfExpr *E) {
+  if (llvm::Value *RelocValue = tryEmitStructLayoutRelocOffsetOf(CGF, E))
+    return RelocValue;
+
   // Try folding the offsetof to a constant.
   Expr::EvalResult EVResult;
   if (E->EvaluateAsInt(EVResult, CGF.getContext())) {
@@ -3304,6 +3439,10 @@ ScalarExprEmitter::VisitUnaryExprOrTypeTraitExpr(
 
       return size;
     }
+
+    if (llvm::Value *RelocValue =
+            tryEmitStructLayoutRelocTypeSize(CGF, TypeToSize))
+      return RelocValue;
   } else if (E->getKind() == UETT_OpenMPRequiredSimdAlign) {
     auto Alignment =
         CGF.getContext()

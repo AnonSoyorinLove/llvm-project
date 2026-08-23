@@ -20,10 +20,15 @@ inline constexpr uint16_t CurrentVersion = 1;
 
 enum class Kind : uint16_t {
   FieldOffsetCode = 1,
+  TypeSizeCode = 2,
+  FieldOffsetData = 3,
+  TypeSizeData = 4,
 };
 
 enum class PatchKind : uint16_t {
   AArch64MovwU32 = 1,
+  AArch64DataU32 = 2,
+  AArch64DataU64 = 3,
 };
 
 enum Flags : uint16_t {

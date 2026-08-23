@@ -29,8 +29,8 @@ long *address_next(struct sample *p) {
 // IR: load i32, ptr {{.*}}, align 1
 // IR: store i32 {{.*}}, ptr {{.*}}, align 1
 // IR: !llvm.struct.layout.reloc = !{![[VALUE:[0-9]+]], ![[VALUE]], ![[ADDR:[0-9]+]]}
-// IR: ![[VALUE]] = !{!"sample", !"value", i32 4, i32 4}
-// IR: ![[ADDR]] = !{!"sample", !"next", i32 8, i32 8}
+// IR: ![[VALUE]] = !{!"sample", !"value", i32 16, i32 4, i32 4}
+// IR: ![[ADDR]] = !{!"sample", !"next", i32 16, i32 8, i32 8}
 
 // PLAIN-NOT: asm sideeffect
 // PLAIN: getelementptr inbounds %struct.sample, ptr {{.*}}, i32 0, i32 1

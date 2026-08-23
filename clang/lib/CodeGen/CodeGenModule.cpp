@@ -53,6 +53,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/BinaryFormat/StructLayoutReloc.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/Frontend/OpenMP/OMPIRBuilder.h"
 #include "llvm/IR/AttributeMask.h"
@@ -69,13 +70,16 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ConvertUTF.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/TimeProfiler.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
 #include "llvm/TargetParser/RISCVISAInfo.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/TargetParser/X86TargetParser.h"
 #include "llvm/Transforms/Utils/BuildLibCalls.h"
 #include <optional>
+#include <string>
 
 using namespace clang;
 using namespace CodeGen;
@@ -5314,6 +5318,136 @@ void CodeGenModule::maybeSetTrivialComdat(const Decl &D,
   GO.setComdat(TheModule.getOrInsertComdat(GO.getName()));
 }
 
+static bool isStructLayoutRelocGlobalType(CodeGenModule &CGM,
+                                           QualType Type,
+                                           const RecordDecl **RecordOut) {
+  if (!CGM.getCodeGenOpts().StructLayoutReloc ||
+      CGM.getLangOpts().CPlusPlus)
+    return false;
+
+  const llvm::Triple &Triple = CGM.getTarget().getTriple();
+  const RecordType *RT = Type->getAs<RecordType>();
+  if (!Triple.isAArch64() || !Triple.isOSBinFormatELF() || !RT)
+    return false;
+
+  const RecordDecl *Record = RT->getDecl();
+  if (Record->isUnion() || !Record->getIdentifier() ||
+      Type->isIncompleteType())
+    return false;
+
+  if (RecordOut)
+    *RecordOut = Record;
+  return true;
+}
+
+static void emitStructLayoutRelocGlobalData(
+    CodeGenModule &CGM, llvm::GlobalVariable *GV,
+    llvm::struct_layout_reloc::Kind RelocKind, const RecordDecl *Record,
+    llvm::StringRef FieldName, uint64_t CompiledTypeSize,
+    uint64_t CompiledFieldOffset, uint64_t CompiledFieldSize,
+    uint32_t FieldIndex) {
+  using namespace llvm::struct_layout_reloc;
+
+  llvm::IntegerType *IntTy = dyn_cast<llvm::IntegerType>(GV->getValueType());
+  if (!IntTy || (IntTy->getBitWidth() != 32 && IntTy->getBitWidth() != 64))
+    return;
+  if (!GV->getInitializer()->getType()->isIntegerTy(IntTy->getBitWidth()))
+    return;
+  if (!llvm::isUInt<32>(CompiledTypeSize) ||
+      !llvm::isUInt<32>(CompiledFieldOffset) ||
+      !llvm::isUInt<32>(CompiledFieldSize))
+    return;
+
+  const PatchKind Encoding = IntTy->getBitWidth() == 64
+                                 ? PatchKind::AArch64DataU64
+                                 : PatchKind::AArch64DataU32;
+  llvm::LLVMContext &Ctx = CGM.getLLVMContext();
+  llvm::NamedMDNode *Relocs =
+      CGM.getModule().getOrInsertNamedMetadata("llvm.struct.layout.reloc");
+  Relocs->addOperand(llvm::MDNode::get(
+      Ctx, {llvm::MDString::get(Ctx, Record->getName()),
+            llvm::MDString::get(Ctx, FieldName),
+            llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                llvm::Type::getInt32Ty(Ctx), CompiledTypeSize)),
+            llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                llvm::Type::getInt32Ty(Ctx), CompiledFieldOffset)),
+            llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                llvm::Type::getInt32Ty(Ctx), CompiledFieldSize))}));
+  std::string Asm;
+  llvm::raw_string_ostream OS(Asm);
+  OS << ".pushsection .llvm_struct_reloc.str,\"MS\",@progbits,1\n\t"
+     << "2:\n\t.asciz \"" << Record->getName() << "\"\n\t"
+     << "3:\n\t.asciz \"" << FieldName << "\"\n\t"
+     << ".popsection\n\t"
+     << ".pushsection .llvm_struct_reloc,\"\",@progbits\n\t"
+     << ".balign 8\n\t"
+     << ".long " << RecordMagic << "\n\t"
+     << ".short " << CurrentVersion << "\n\t"
+     << ".short " << static_cast<uint16_t>(RelocKind) << "\n\t"
+     << ".short " << static_cast<uint16_t>(Encoding) << "\n\t"
+     << ".short " << static_cast<uint16_t>(IsStruct) << "\n\t"
+     << ".long " << sizeof(RecordV1) << "\n\t"
+     << ".quad " << GV->getName() << "\n\t"
+     << ".quad 2b\n\t"
+     << ".quad 3b\n\t"
+     << ".long " << CompiledTypeSize << "\n\t"
+     << ".long " << CompiledFieldOffset << "\n\t"
+     << ".long " << CompiledFieldSize << "\n\t"
+     << ".long " << FieldIndex << "\n\t"
+     << ".long 0\n\t"
+     << ".long 0\n\t"
+     << ".popsection";
+  CGM.getModule().appendModuleInlineAsm(OS.str());
+}
+
+static void maybeEmitStructLayoutRelocGlobalData(CodeGenModule &CGM,
+                                                 llvm::GlobalVariable *GV,
+                                                 const Expr *InitExpr) {
+  if (!InitExpr || !GV || !CGM.getCodeGenOpts().StructLayoutReloc ||
+      CGM.getLangOpts().CPlusPlus)
+    return;
+
+  const Expr *Expr = InitExpr->IgnoreParenImpCasts();
+  using namespace llvm::struct_layout_reloc;
+  if (const auto *Offset = dyn_cast<OffsetOfExpr>(Expr)) {
+    if (Offset->getNumComponents() != 1 ||
+        Offset->getComponent(0).getKind() != OffsetOfNode::Field)
+      return;
+    FieldDecl *Field = Offset->getComponent(0).getField();
+    const RecordDecl *Record = nullptr;
+    if (!isStructLayoutRelocGlobalType(CGM,
+                                       Offset->getTypeSourceInfo()->getType(),
+                                       &Record) ||
+        Field->getParent() != Record)
+      return;
+    const ASTRecordLayout &Layout =
+        CGM.getContext().getASTRecordLayout(Record);
+    uint64_t TypeSize = Layout.getSize().getQuantity();
+    uint64_t FieldOffset =
+        Layout.getFieldOffset(Field->getFieldIndex()) /
+        CGM.getContext().getCharWidth();
+    uint64_t FieldSize =
+        CGM.getContext().getTypeSizeInChars(Field->getType()).getQuantity();
+    emitStructLayoutRelocGlobalData(
+        CGM, GV, Kind::FieldOffsetData, Record, Field->getName(), TypeSize,
+        FieldOffset, FieldSize, Field->getFieldIndex());
+    return;
+  }
+
+  const auto *Trait = dyn_cast<UnaryExprOrTypeTraitExpr>(Expr);
+  if (!Trait || (Trait->getKind() != UETT_SizeOf &&
+                 Trait->getKind() != UETT_DataSizeOf))
+    return;
+  const RecordDecl *Record = nullptr;
+  if (!isStructLayoutRelocGlobalType(CGM, Trait->getTypeOfArgument(),
+                                     &Record))
+    return;
+  uint64_t TypeSize =
+      CGM.getContext().getASTRecordLayout(Record).getSize().getQuantity();
+  emitStructLayoutRelocGlobalData(CGM, GV, Kind::TypeSizeData, Record,
+                                  "<type-size>", TypeSize, 0, 0, 0);
+}
+
 /// Pass IsTentative as true if you want to create a tentative definition.
 void CodeGenModule::EmitGlobalVarDefinition(const VarDecl *D,
                                             bool IsTentative) {
@@ -5486,6 +5620,7 @@ void CodeGenModule::EmitGlobalVarDefinition(const VarDecl *D,
   }
 
   GV->setInitializer(Init);
+  maybeEmitStructLayoutRelocGlobalData(*this, GV, InitExpr);
   if (emitter)
     emitter->finalize(GV);
 
