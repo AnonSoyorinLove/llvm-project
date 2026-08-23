@@ -5456,6 +5456,8 @@ static llvm::Constant *extendStructLayoutRelocGlobalInitializer(
   CompiledSize = CGM.getDataLayout().getTypeAllocSize(InitType);
   ReserveSize = std::max<uint64_t>(
       CompiledSize, CGM.getCodeGenOpts().StructLayoutRelocGlobalReserve);
+  ReserveSize = llvm::alignTo(
+      ReserveSize, CGM.getDataLayout().getABITypeAlign(InitType).value());
   if (ReserveSize == CompiledSize)
     return Init;
 
