@@ -23,12 +23,38 @@ long *address_next(struct sample *p) {
   return &p->next;
 }
 
+extern struct sample global_sample;
+
+void inline_asm_immediate(void) {
+  __asm__ volatile(".quad %c0" : : "i"(&global_sample.next));
+}
+
+static __attribute__((always_inline)) inline void
+inline_asm_immediate_helper(long *pointer) {
+  __asm__ volatile(".quad %c0" : : "i"(pointer));
+}
+
+void inline_asm_immediate_call(void) {
+  inline_asm_immediate_helper(&global_sample.next);
+}
+
+long load_global_next(void) {
+  return global_sample.next;
+}
+
 // IR: call i64 asm sideeffect
 // IR-SAME: movz ${0:x}, #4
 // IR: getelementptr i8, ptr {{.*}}, i64 %struct.field.offset
 // IR: load i32, ptr {{.*}}, align 1
 // IR: store i32 {{.*}}, ptr {{.*}}, align 1
-// IR: !llvm.struct.layout.reloc = !{![[VALUE:[0-9]+]], ![[VALUE]], ![[ADDR:[0-9]+]]}
+// IR-LABEL: define dso_local void @inline_asm_immediate()
+// IR: call void asm sideeffect ".quad ${0:c}", "i"(ptr getelementptr inbounds (%struct.sample, ptr @global_sample, i32 0, i32 2))
+// IR-LABEL: define dso_local void @inline_asm_immediate_call()
+// IR: store ptr getelementptr inbounds (%struct.sample, ptr @global_sample, i32 0, i32 2)
+// IR: call void asm sideeffect ".quad ${0:c}", "i"(ptr %{{.*}})
+// IR-LABEL: define dso_local i64 @load_global_next()
+// IR: call i64 asm sideeffect
+// IR: !llvm.struct.layout.reloc = !{![[VALUE:[0-9]+]], ![[VALUE]], ![[ADDR:[0-9]+]], ![[ADDR]]}
 // IR: ![[VALUE]] = !{!"sample", !"value", i32 16, i32 4, i32 4}
 // IR: ![[ADDR]] = !{!"sample", !"next", i32 16, i32 8, i32 8}
 

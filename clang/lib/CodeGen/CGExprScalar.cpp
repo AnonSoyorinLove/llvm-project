@@ -70,6 +70,9 @@ namespace {
 /// all other opcodes, to be conservative.
 bool shouldEmitStructLayoutRelocValue(CodeGenFunction &CGF, QualType Type,
                                       const RecordDecl **RecordOut) {
+  if (CGF.SuppressStructLayoutReloc)
+    return false;
+
   const RecordType *RT = Type->getAs<RecordType>();
   if (!RT)
     return false;

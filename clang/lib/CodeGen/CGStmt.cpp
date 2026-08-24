@@ -2375,6 +2375,11 @@ CodeGenFunction::EmitAsmInput(const TargetInfo::ConstraintInfo &Info,
     if (InputExpr->EvaluateAsInt(Result, getContext()))
       return {llvm::ConstantInt::get(getLLVMContext(), Result.Val.getInt()),
               nullptr};
+
+    if (CodeGenFunction::hasScalarEvaluationKind(InputExpr->getType())) {
+      llvm::SaveAndRestore<bool> SuppressReloc(SuppressStructLayoutReloc, true);
+      return {EmitScalarExpr(InputExpr), nullptr};
+    }
   }
 
   if (Info.allowsRegister() || !Info.allowsMemory())

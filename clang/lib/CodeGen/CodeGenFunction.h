@@ -602,6 +602,10 @@ public:
   /// region.
   bool IsInPreservedAIRegion = false;
 
+  /// True while emitting an inline asm operand which must remain a compile-time
+  /// constant or symbolic address.
+  bool SuppressStructLayoutReloc = false;
+
   /// True if the current statement has nomerge attribute.
   bool InNoMergeAttributedStmt = false;
 

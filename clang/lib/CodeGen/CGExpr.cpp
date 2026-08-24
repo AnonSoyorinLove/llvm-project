@@ -4795,7 +4795,8 @@ static Address emitAddrOfFieldStorage(CodeGenFunction &CGF, Address base,
 
 static bool shouldEmitStructLayoutReloc(CodeGenFunction &CGF,
                                         const FieldDecl *Field) {
-  return CGF.CGM.isStructLayoutRelocEnabledFor(Field->getParent()) &&
+  return !CGF.SuppressStructLayoutReloc &&
+         CGF.CGM.isStructLayoutRelocEnabledFor(Field->getParent()) &&
          Field->getIdentifier() && !Field->getType()->isIncompleteType();
 }
 

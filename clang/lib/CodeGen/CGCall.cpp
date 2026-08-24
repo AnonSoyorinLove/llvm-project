@@ -40,6 +40,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Type.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include <optional>
 using namespace clang;
@@ -4462,6 +4463,46 @@ static bool isObjCMethodWithTypeParams(const ObjCMethodDecl *method) {
 }
 #endif
 
+static bool containsImmediateOnlyAsmInput(const Stmt *S,
+                                          const TargetInfo &Target) {
+  if (!S)
+    return false;
+
+  if (const auto *Asm = dyn_cast<AsmStmt>(S)) {
+    SmallVector<TargetInfo::ConstraintInfo, 4> OutputInfos;
+    for (unsigned I = 0, E = Asm->getNumOutputs(); I != E; ++I) {
+      StringRef Name;
+      if (const auto *GCCAsm = dyn_cast<GCCAsmStmt>(Asm))
+        Name = GCCAsm->getOutputName(I);
+      TargetInfo::ConstraintInfo Info(Asm->getOutputConstraint(I), Name);
+      if (!Target.validateOutputConstraint(Info))
+        return false;
+      OutputInfos.push_back(Info);
+    }
+
+    for (unsigned I = 0, E = Asm->getNumInputs(); I != E; ++I) {
+      StringRef Name;
+      if (const auto *GCCAsm = dyn_cast<GCCAsmStmt>(Asm))
+        Name = GCCAsm->getInputName(I);
+      TargetInfo::ConstraintInfo Info(Asm->getInputConstraint(I), Name);
+      if (Target.validateInputConstraint(OutputInfos, Info) &&
+          !Info.allowsRegister() && !Info.allowsMemory())
+        return true;
+    }
+  }
+
+  return llvm::any_of(S->children(), [&](const Stmt *Child) {
+    return containsImmediateOnlyAsmInput(Child, Target);
+  });
+}
+
+static bool callArgsMustRemainConstantForInlineAsm(
+    CodeGenFunction::AbstractCallee Callee, const TargetInfo &Target) {
+  const auto *FD = dyn_cast_or_null<FunctionDecl>(Callee.getDecl());
+  return FD && FD->hasAttr<AlwaysInlineAttr>() && FD->hasBody() &&
+         containsImmediateOnlyAsmInput(FD->getBody(), Target);
+}
+
 /// EmitCallArgs - Emit call arguments for a function.
 void CodeGenFunction::EmitCallArgs(
     CallArgList &Args, PrototypeWrapper Prototype,
@@ -4566,6 +4607,10 @@ void CodeGenFunction::EmitCallArgs(
   }
 
   // Evaluate each argument in the appropriate order.
+  llvm::SaveAndRestore<bool> SuppressReloc(
+      SuppressStructLayoutReloc,
+      SuppressStructLayoutReloc ||
+          callArgsMustRemainConstantForInlineAsm(AC, getTarget()));
   size_t CallArgsStart = Args.size();
   for (unsigned I = 0, E = ArgTypes.size(); I != E; ++I) {
     unsigned Idx = LeftToRight ? I : E - I - 1;
