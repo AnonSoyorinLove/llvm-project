@@ -439,6 +439,16 @@ public:
   /// binary metadata pass should not be instrumented.
   std::vector<std::string> SanitizeMetadataIgnorelistFiles;
 
+  /// Restrict struct layout relocation to records defined below one of these
+  /// source path prefixes. An empty list means no path filtering.
+  std::vector<std::string> StructLayoutRelocFilePrefixes;
+
+  /// JSON file containing exact struct tag names in "whitelist" and
+  /// "blacklist" arrays. The parsed names are stored below.
+  std::string StructLayoutRelocConfigFile;
+  std::vector<std::string> StructLayoutRelocWhitelist;
+  std::vector<std::string> StructLayoutRelocBlacklist;
+
   /// Name of the stack usage file (i.e., .su file) if user passes
   /// -fstack-usage. If empty, it can be implied that -fstack-usage is not
   /// passed on the command line.

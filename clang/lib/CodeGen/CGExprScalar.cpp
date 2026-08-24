@@ -68,22 +68,16 @@ namespace {
 /// and signed BO_{Div,Rem}. For these opcodes, and for unsigned BO_{Div,Rem},
 /// the returned overflow check is precise. The returned value is 'true' for
 /// all other opcodes, to be conservative.
-bool shouldEmitStructLayoutRelocValue(CodeGenFunction &CGF,
-                                      QualType Type,
+bool shouldEmitStructLayoutRelocValue(CodeGenFunction &CGF, QualType Type,
                                       const RecordDecl **RecordOut) {
-  if (!CGF.CGM.getCodeGenOpts().StructLayoutReloc ||
-      CGF.getLangOpts().CPlusPlus)
-    return false;
-
-  const llvm::Triple &Triple = CGF.CGM.getTarget().getTriple();
   const RecordType *RT = Type->getAs<RecordType>();
-  if (!Triple.isAArch64() || !Triple.isOSBinFormatELF() || !RT)
+  if (!RT)
     return false;
 
   const RecordDecl *Record = RT->getDecl();
-  if (Record->isUnion() || !Record->getIdentifier() ||
-      Type->isIncompleteType())
+  if (!CGF.CGM.isStructLayoutRelocEnabledFor(Record))
     return false;
+  Record = Record->getDefinition();
 
   if (RecordOut)
     *RecordOut = Record;

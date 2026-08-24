@@ -75,6 +75,7 @@
 #include "llvm/Support/ErrorOr.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/HashBuilder.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
@@ -1704,6 +1705,74 @@ void CompilerInvocationBase::GenerateCodeGenArgs(const CodeGenOptions &Opts,
   }
 }
 
+static bool parseStructLayoutRelocConfig(CodeGenOptions &Opts,
+                                         DiagnosticsEngine &Diags) {
+  Opts.StructLayoutRelocWhitelist.clear();
+  Opts.StructLayoutRelocBlacklist.clear();
+  if (Opts.StructLayoutRelocConfigFile.empty())
+    return true;
+
+  auto Buffer = llvm::MemoryBuffer::getFile(Opts.StructLayoutRelocConfigFile);
+  if (!Buffer) {
+    Diags.Report(diag::err_drv_cannot_read_config_file)
+        << Opts.StructLayoutRelocConfigFile << Buffer.getError().message();
+    return false;
+  }
+
+  auto Parsed = llvm::json::parse((*Buffer)->getBuffer());
+  if (!Parsed) {
+    Diags.Report(diag::err_drv_invalid_struct_layout_reloc_config)
+        << Opts.StructLayoutRelocConfigFile
+        << llvm::toString(Parsed.takeError());
+    return false;
+  }
+
+  const llvm::json::Object *Object = Parsed->getAsObject();
+  if (!Object) {
+    Diags.Report(diag::err_drv_invalid_struct_layout_reloc_config)
+        << Opts.StructLayoutRelocConfigFile
+        << "top-level value must be an object";
+    return false;
+  }
+
+  for (const auto &Entry : *Object) {
+    llvm::StringRef Key = Entry.first;
+    if (Key != "whitelist" && Key != "blacklist") {
+      Diags.Report(diag::err_drv_invalid_struct_layout_reloc_config)
+          << Opts.StructLayoutRelocConfigFile
+          << ("unknown key '" + Key + "'").str();
+      return false;
+    }
+  }
+
+  auto ParseList = [&](llvm::StringRef Key, std::vector<std::string> &Output) {
+    const llvm::json::Value *Value = Object->get(Key);
+    if (!Value)
+      return true;
+    const llvm::json::Array *Array = Value->getAsArray();
+    if (!Array) {
+      Diags.Report(diag::err_drv_invalid_struct_layout_reloc_config)
+          << Opts.StructLayoutRelocConfigFile
+          << ("'" + Key + "' must be an array of strings").str();
+      return false;
+    }
+    for (const llvm::json::Value &Element : *Array) {
+      std::optional<llvm::StringRef> Name = Element.getAsString();
+      if (!Name || Name->empty()) {
+        Diags.Report(diag::err_drv_invalid_struct_layout_reloc_config)
+            << Opts.StructLayoutRelocConfigFile
+            << ("'" + Key + "' entries must be non-empty strings").str();
+        return false;
+      }
+      Output.emplace_back(*Name);
+    }
+    return true;
+  };
+
+  return ParseList("whitelist", Opts.StructLayoutRelocWhitelist) &&
+         ParseList("blacklist", Opts.StructLayoutRelocBlacklist);
+}
+
 bool CompilerInvocation::ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args,
                                           InputKind IK,
                                           DiagnosticsEngine &Diags,
@@ -2163,6 +2232,12 @@ bool CompilerInvocation::ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args,
   if (!Opts.EmitIEEENaNCompliantInsts && !LangOptsRef.NoHonorNaNs)
     Diags.Report(diag::err_drv_amdgpu_ieee_without_no_honor_nans);
 
+  for (llvm::StringRef Prefix : Opts.StructLayoutRelocFilePrefixes)
+    if (Prefix.empty())
+      Diags.Report(diag::err_drv_empty_struct_layout_reloc_file_prefix);
+
+  parseStructLayoutRelocConfig(Opts, Diags);
+
   return Diags.getNumErrors() == NumErrorsBefore;
 }
 
@@ -2181,6 +2256,9 @@ static void GenerateDependencyOutputArgs(const DependencyOutputOptions &Opts,
     switch (Dep.second) {
     case EDK_SanitizeIgnorelist:
       // Sanitizer ignorelist arguments are generated from LanguageOptions.
+      continue;
+    case EDK_StructLayoutRelocConfig:
+      // The config argument is generated from CodeGenOptions.
       continue;
     case EDK_ModuleFile:
       // Module file arguments are generated from FrontendOptions and
@@ -2242,6 +2320,10 @@ static bool ParseDependencyOutputArgs(DependencyOutputOptions &Opts,
   // -fprofile-list= dependencies.
   for (const auto &Filename : Args.getAllArgValues(OPT_fprofile_list_EQ))
     Opts.ExtraDeps.emplace_back(Filename, EDK_ProfileList);
+
+  for (const auto &Filename :
+       Args.getAllArgValues(OPT_fstruct_layout_reloc_config_EQ))
+    Opts.ExtraDeps.emplace_back(Filename, EDK_StructLayoutRelocConfig);
 
   // Propagate the extra dependencies.
   for (const auto *A : Args.filtered(OPT_fdepfile_entry))

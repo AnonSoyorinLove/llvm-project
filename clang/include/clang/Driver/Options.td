@@ -1597,6 +1597,20 @@ defm struct_layout_reloc : BoolFOption<"struct-layout-reloc",
   NegFlag<SetFalse, [], [ClangOption, CC1Option],
           "Disable struct layout relocation code generation">>;
 
+def fstruct_layout_reloc_file_prefix_EQ :
+  Joined<["-"], "fstruct-layout-reloc-file-prefix=">, Group<f_Group>,
+  Visibility<[ClangOption, CC1Option]>, MetaVarName<"<prefix>">,
+  HelpText<"Restrict struct layout relocation to records defined under a "
+           "source path prefix (repeatable)">,
+  MarshallingInfoStringVector<CodeGenOpts<"StructLayoutRelocFilePrefixes">>;
+
+def fstruct_layout_reloc_config_EQ :
+  Joined<["-"], "fstruct-layout-reloc-config=">, Group<f_Group>,
+  Visibility<[ClangOption, CC1Option]>, MetaVarName<"<file>">,
+  HelpText<"Read struct layout relocation whitelist and blacklist from a JSON "
+           "file">,
+  MarshallingInfoString<CodeGenOpts<"StructLayoutRelocConfigFile">>;
+
 def fstruct_layout_reloc_global_reserve_EQ : Joined<["-"], "fstruct-layout-reloc-global-reserve=">,
   Group<f_Group>, Visibility<[ClangOption, CC1Option]>,
   MetaVarName<"<bytes>">,

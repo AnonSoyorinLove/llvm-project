@@ -50,11 +50,12 @@
 #include "clang/CodeGen/ConstantInitBuilder.h"
 #include "clang/Frontend/FrontendDiagnostic.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
-#include "llvm/BinaryFormat/StructLayoutReloc.h"
 #include "llvm/BinaryFormat/ELF.h"
+#include "llvm/BinaryFormat/StructLayoutReloc.h"
 #include "llvm/Frontend/OpenMP/OMPIRBuilder.h"
 #include "llvm/IR/AttributeMask.h"
 #include "llvm/IR/CallingConv.h"
@@ -71,6 +72,7 @@
 #include "llvm/Support/ConvertUTF.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
@@ -456,6 +458,66 @@ CodeGenModule::CodeGenModule(ASTContext &C,
 }
 
 CodeGenModule::~CodeGenModule() {}
+
+static void normalizeStructLayoutRelocPath(const llvm::vfs::FileSystem &FS,
+                                           llvm::SmallVectorImpl<char> &Path) {
+  (void)FS.makeAbsolute(Path);
+  llvm::sys::path::remove_dots(Path, /*remove_dot_dot=*/true);
+}
+
+static bool isStructLayoutRelocPathPrefix(llvm::StringRef Path,
+                                          llvm::StringRef Prefix) {
+  if (Prefix.empty() || !Path.starts_with(Prefix))
+    return false;
+  return Path.size() == Prefix.size() ||
+         llvm::sys::path::is_separator(Prefix.back()) ||
+         llvm::sys::path::is_separator(Path[Prefix.size()]);
+}
+
+bool CodeGenModule::isStructLayoutRelocEnabledFor(
+    const RecordDecl *Record) const {
+  if (!CodeGenOpts.StructLayoutReloc || LangOpts.CPlusPlus || !Record ||
+      !Target.getTriple().isAArch64() || !Target.getTriple().isOSBinFormatELF())
+    return false;
+
+  Record = Record->getDefinition();
+  if (!Record || Record->isUnion() || !Record->getIdentifier())
+    return false;
+
+  auto Cached = StructLayoutRelocSelectionCache.find(Record);
+  if (Cached != StructLayoutRelocSelectionCache.end())
+    return Cached->second;
+
+  bool Selected = true;
+  llvm::StringRef Name = Record->getName();
+  if (llvm::is_contained(CodeGenOpts.StructLayoutRelocBlacklist, Name))
+    Selected = false;
+  else if (!CodeGenOpts.StructLayoutRelocWhitelist.empty() &&
+           !llvm::is_contained(CodeGenOpts.StructLayoutRelocWhitelist, Name))
+    Selected = false;
+
+  if (Selected && !CodeGenOpts.StructLayoutRelocFilePrefixes.empty()) {
+    Selected = false;
+    SourceManager &SM = Context.getSourceManager();
+    SourceLocation DefinitionLoc = SM.getExpansionLoc(Record->getLocation());
+    llvm::StringRef Filename = SM.getFilename(DefinitionLoc);
+    if (!Filename.empty()) {
+      llvm::SmallString<256> DefinitionPath(Filename);
+      normalizeStructLayoutRelocPath(*FS, DefinitionPath);
+      for (llvm::StringRef Prefix : CodeGenOpts.StructLayoutRelocFilePrefixes) {
+        llvm::SmallString<256> NormalizedPrefix(Prefix);
+        normalizeStructLayoutRelocPath(*FS, NormalizedPrefix);
+        if (isStructLayoutRelocPathPrefix(DefinitionPath, NormalizedPrefix)) {
+          Selected = true;
+          break;
+        }
+      }
+    }
+  }
+
+  StructLayoutRelocSelectionCache[Record] = Selected;
+  return Selected;
+}
 
 void CodeGenModule::createObjCRuntime() {
   // This is just isGNUFamily(), but we want to force implementors of
@@ -5318,22 +5380,16 @@ void CodeGenModule::maybeSetTrivialComdat(const Decl &D,
   GO.setComdat(TheModule.getOrInsertComdat(GO.getName()));
 }
 
-static bool isStructLayoutRelocGlobalType(CodeGenModule &CGM,
-                                           QualType Type,
-                                           const RecordDecl **RecordOut) {
-  if (!CGM.getCodeGenOpts().StructLayoutReloc ||
-      CGM.getLangOpts().CPlusPlus)
-    return false;
-
-  const llvm::Triple &Triple = CGM.getTarget().getTriple();
+static bool isStructLayoutRelocGlobalType(CodeGenModule &CGM, QualType Type,
+                                          const RecordDecl **RecordOut) {
   const RecordType *RT = Type->getAs<RecordType>();
-  if (!Triple.isAArch64() || !Triple.isOSBinFormatELF() || !RT)
+  if (!RT)
     return false;
 
   const RecordDecl *Record = RT->getDecl();
-  if (Record->isUnion() || !Record->getIdentifier() ||
-      Type->isIncompleteType())
+  if (!CGM.isStructLayoutRelocEnabledFor(Record))
     return false;
+  Record = Record->getDefinition();
 
   if (RecordOut)
     *RecordOut = Record;

@@ -25,6 +25,7 @@ enum class DependencyOutputFormat { Make, NMake };
 enum ExtraDepKind {
   EDK_SanitizeIgnorelist,
   EDK_ProfileList,
+  EDK_StructLayoutRelocConfig,
   EDK_ModuleFile,
   EDK_DepFileEntry,
 };

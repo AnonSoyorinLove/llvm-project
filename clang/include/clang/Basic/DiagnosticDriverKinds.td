@@ -261,6 +261,10 @@ def note_drv_config_file_searched_in : Note<
   "was searched for in the directory: %0">;
 def err_drv_cannot_read_config_file : Error<
   "cannot read configuration file '%0': %1">;
+def err_drv_invalid_struct_layout_reloc_config : Error<
+  "invalid struct layout relocation config file '%0': %1">;
+def err_drv_empty_struct_layout_reloc_file_prefix : Error<
+  "struct layout relocation file prefix cannot be empty">;
 def err_drv_arg_requires_bitcode_input: Error<
   "option '%0' requires input to be LLVM bitcode">;
 

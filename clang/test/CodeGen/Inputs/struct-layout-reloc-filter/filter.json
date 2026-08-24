@@ -1,0 +1,4 @@
+{
+  "whitelist": ["prefix_one", "prefix_two"],
+  "blacklist": ["prefix_two"]
+}

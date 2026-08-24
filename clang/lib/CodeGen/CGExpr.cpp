@@ -4795,14 +4795,7 @@ static Address emitAddrOfFieldStorage(CodeGenFunction &CGF, Address base,
 
 static bool shouldEmitStructLayoutReloc(CodeGenFunction &CGF,
                                         const FieldDecl *Field) {
-  if (!CGF.CGM.getCodeGenOpts().StructLayoutReloc ||
-      CGF.getLangOpts().CPlusPlus)
-    return false;
-
-  const llvm::Triple &Triple = CGF.CGM.getTarget().getTriple();
-  const RecordDecl *Record = Field->getParent();
-  return Triple.isAArch64() && Triple.isOSBinFormatELF() &&
-         !Record->isUnion() && Record->getIdentifier() &&
+  return CGF.CGM.isStructLayoutRelocEnabledFor(Field->getParent()) &&
          Field->getIdentifier() && !Field->getType()->isIncompleteType();
 }
 
