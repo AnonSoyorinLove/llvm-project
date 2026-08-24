@@ -1611,11 +1611,12 @@ def fstruct_layout_reloc_config_EQ :
            "file">,
   MarshallingInfoString<CodeGenOpts<"StructLayoutRelocConfigFile">>;
 
-def fstruct_layout_reloc_global_reserve_EQ : Joined<["-"], "fstruct-layout-reloc-global-reserve=">,
+def fstruct_layout_reloc_global_extra_bytes_EQ : Joined<["-"], "fstruct-layout-reloc-global-extra-bytes=">,
   Group<f_Group>, Visibility<[ClangOption, CC1Option]>,
   MetaVarName<"<bytes>">,
-  HelpText<"Reserve bytes for relocatable file-scope struct objects">,
-  MarshallingInfoInt<CodeGenOpts<"StructLayoutRelocGlobalReserve">, "0">;
+  HelpText<"Add trailing reserve bytes to relocatable file-scope struct "
+           "objects">,
+  MarshallingInfoInt<CodeGenOpts<"StructLayoutRelocGlobalExtraBytes">, "0">;
 
 defm assume_unique_vtables : BoolFOption<"assume-unique-vtables",
   CodeGenOpts<"AssumeUniqueVTables">, DefaultTrue,

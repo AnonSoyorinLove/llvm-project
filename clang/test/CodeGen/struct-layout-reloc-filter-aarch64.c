@@ -2,12 +2,12 @@
 // RUN:   -I %S/Inputs/struct-layout-reloc-filter \
 // RUN:   -fstruct-layout-reloc-file-prefix=%S/Inputs/struct-layout-reloc-filter/one \
 // RUN:   -fstruct-layout-reloc-file-prefix=%S/Inputs/struct-layout-reloc-filter/two \
-// RUN:   -fstruct-layout-reloc-global-reserve=32 \
+// RUN:   -fstruct-layout-reloc-global-extra-bytes=32 \
 // RUN:   -emit-llvm -o - %s | FileCheck %s --check-prefix=PREFIX
 // RUN: %clang_cc1 -triple aarch64-unknown-linux-gnu -fstruct-layout-reloc \
 // RUN:   -I %S/Inputs/struct-layout-reloc-filter \
 // RUN:   -fstruct-layout-reloc-config=%S/Inputs/struct-layout-reloc-filter/filter.json \
-// RUN:   -fstruct-layout-reloc-global-reserve=32 \
+// RUN:   -fstruct-layout-reloc-global-extra-bytes=32 \
 // RUN:   -emit-llvm -o - %s | FileCheck %s --check-prefix=CONFIG
 // RUN: not %clang_cc1 -triple aarch64-unknown-linux-gnu \
 // RUN:   -fstruct-layout-reloc \
@@ -49,7 +49,7 @@ void stack_other(void) {
   struct prefix_other value;
 }
 
-// PREFIX: %prefix_one.reloc = type { %struct.prefix_one, [24 x i8] }
+// PREFIX: %prefix_one.reloc = type { %struct.prefix_one, [32 x i8] }
 // PREFIX: @global_one = global %prefix_one.reloc
 // PREFIX: @global_other = global %struct.prefix_other
 
@@ -72,7 +72,7 @@ void stack_other(void) {
 // PREFIX-NOT: call i64 asm sideeffect
 // PREFIX: alloca %struct.prefix_other
 
-// CONFIG: %prefix_one.reloc = type { %struct.prefix_one, [24 x i8] }
+// CONFIG: %prefix_one.reloc = type { %struct.prefix_one, [32 x i8] }
 // CONFIG: @global_one = global %prefix_one.reloc
 // CONFIG: @global_other = global %struct.prefix_other
 

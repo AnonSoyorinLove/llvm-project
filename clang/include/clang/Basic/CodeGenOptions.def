@@ -451,8 +451,8 @@ CODEGENOPT(CtorDtorReturnThis, 1, 0)
 /// Emit patchable AArch64 field offsets and struct relocation metadata.
 CODEGENOPT(StructLayoutReloc, 1, 0)
 
-// Reserve bytes for relocatable file-scope struct objects.
-VALUE_CODEGENOPT(StructLayoutRelocGlobalReserve, 32, 0)
+// Extra trailing bytes for relocatable file-scope struct objects.
+VALUE_CODEGENOPT(StructLayoutRelocGlobalExtraBytes, 32, 0)
 
 /// FIXME: Make DebugOptions its own top-level .def file.
 #include "DebugOptions.def"
