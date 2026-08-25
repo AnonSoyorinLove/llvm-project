@@ -947,6 +947,26 @@ static llvm::Value *getArrayIndexingBound(CodeGenFunction &CGF,
 
       IndexedType = CE->getSubExpr()->getType();
       const ArrayType *AT = IndexedType->castAsArrayTypeUnsafe();
+      const Expr *ArrayExpr = CE->getSubExpr()->IgnoreParenImpCasts();
+      const auto *Member = dyn_cast<MemberExpr>(ArrayExpr);
+      const auto *Field =
+          Member ? dyn_cast<FieldDecl>(Member->getMemberDecl()) : nullptr;
+      if (llvm::Value *FieldSize = CGF.EmitStructLayoutRelocFieldSize(Field)) {
+        QualType ElementType = AT->getElementType();
+        llvm::Value *ElementSize =
+            CGF.EmitStructLayoutRelocObjectSize(ElementType);
+        if (!ElementSize)
+          ElementSize =
+              CGF.CGM.getSize(CGF.getContext().getTypeSizeInChars(ElementType));
+        if (FieldSize->getType() != CGF.SizeTy)
+          FieldSize = CGF.Builder.CreateIntCast(FieldSize, CGF.SizeTy, false,
+                                                "reloc.field.size");
+        if (ElementSize->getType() != CGF.SizeTy)
+          ElementSize = CGF.Builder.CreateIntCast(ElementSize, CGF.SizeTy,
+                                                  false, "reloc.element.size");
+        return CGF.Builder.CreateUDiv(FieldSize, ElementSize,
+                                      "struct.layout.reloc.array.bound");
+      }
       if (const auto *CAT = dyn_cast<ConstantArrayType>(AT))
         return CGF.Builder.getInt(CAT->getSize());
 
@@ -3975,24 +3995,26 @@ static CharUnits getArrayElementAlign(CharUnits arrayAlign,
   }
 }
 
-static Address emitStructLayoutRelocArrayElement(CodeGenFunction &CGF,
-                                                 Address Base,
-                                                 llvm::Value *Index,
-                                                 QualType ElementType,
-                                                 bool InBounds,
-                                                 bool SignedIndices,
-                                                 SourceLocation Loc) {
-  llvm::Value *ElementSize =
-      CGF.EmitStructLayoutRelocObjectSize(ElementType);
-  if (!ElementSize)
-    return Address::invalid();
+static Address emitStructLayoutRelocArrayElement(
+    CodeGenFunction &CGF, Address Base, llvm::Value *Index,
+    QualType ElementType, bool InBounds, bool SignedIndices, SourceLocation Loc,
+    const FieldDecl *ArrayField = nullptr) {
+  llvm::Value *ElementSize = CGF.EmitStructLayoutRelocObjectSize(ElementType);
+  if (!ElementSize) {
+    if (!ArrayField || CGF.SuppressStructLayoutReloc ||
+        !ArrayField->getType()->isArrayType() ||
+        !CGF.CGM.isStructLayoutRelocEnabledFor(ArrayField->getParent()))
+      return Address::invalid();
+    ElementSize =
+        CGF.CGM.getSize(CGF.getContext().getTypeSizeInChars(ElementType));
+  }
 
   if (Index->getType() != CGF.IntPtrTy)
-    Index = CGF.Builder.CreateIntCast(Index, CGF.IntPtrTy,
-                                      SignedIndices, "reloc.idxprom");
+    Index = CGF.Builder.CreateIntCast(Index, CGF.IntPtrTy, SignedIndices,
+                                      "reloc.idxprom");
   if (ElementSize->getType() != CGF.IntPtrTy)
-    ElementSize = CGF.Builder.CreateIntCast(ElementSize, CGF.IntPtrTy,
-                                            false, "reloc.sizeprom");
+    ElementSize = CGF.Builder.CreateIntCast(ElementSize, CGF.IntPtrTy, false,
+                                            "reloc.sizeprom");
   llvm::Value *ScaledIndex =
       CGF.Builder.CreateMul(Index, ElementSize, "struct.layout.reloc.stride");
   llvm::Value *Ptr = emitArraySubscriptGEP(
@@ -4348,10 +4370,15 @@ LValue CodeGenFunction::EmitArraySubscriptExpr(const ArraySubscriptExpr *E,
 
     // Propagate the alignment from the array itself to the result.
     QualType arrayType = Array->getType();
+    const auto *ArrayMember =
+        dyn_cast<MemberExpr>(Array->IgnoreParenImpCasts());
+    const auto *ArrayField =
+        ArrayMember ? dyn_cast<FieldDecl>(ArrayMember->getMemberDecl())
+                    : nullptr;
     Addr = emitStructLayoutRelocArrayElement(
         *this, ArrayLV.getAddress(*this), Idx, E->getType(),
         !getLangOpts().isSignedOverflowDefined(), SignedIndices,
-        E->getExprLoc());
+        E->getExprLoc(), ArrayField);
     if (!Addr.isValid())
       Addr = emitArraySubscriptGEP(
           *this, ArrayLV.getAddress(*this),
@@ -4813,6 +4840,8 @@ static Address emitStructLayoutRelocFieldStorage(CodeGenFunction &CGF,
   const uint64_t RecordSize = Layout.getSize().getQuantity();
   const uint64_t FieldSize =
       CGF.getContext().getTypeSizeInChars(Field->getType()).getQuantity();
+  auto [FieldType, FieldTypeName] =
+      CGF.CGM.getStructLayoutRelocFieldTypeInfo(Field->getType());
 
   if (!llvm::isUInt<32>(FieldOffset) || !llvm::isUInt<32>(RecordSize) ||
       !llvm::isUInt<32>(FieldSize))
@@ -4842,6 +4871,7 @@ static Address emitStructLayoutRelocFieldStorage(CodeGenFunction &CGF,
      << ".pushsection .llvm_struct_reloc.str,\"MS\",@progbits,1\n\t"
      << "2:\n\t.asciz \"" << Record->getName() << "\"\n\t"
      << "3:\n\t.asciz \"" << Field->getName() << "\"\n\t"
+     << "4:\n\t.asciz \"" << FieldTypeName << "\"\n\t"
      << ".popsection\n\t"
      << ".pushsection .llvm_struct_reloc,\"\",@progbits\n\t"
      << ".balign 8\n\t"
@@ -4850,7 +4880,7 @@ static Address emitStructLayoutRelocFieldStorage(CodeGenFunction &CGF,
      << ".short " << static_cast<uint16_t>(Kind::FieldOffsetCode) << "\n\t"
      << ".short " << static_cast<uint16_t>(PatchKind::AArch64MovwU32) << "\n\t"
      << ".short " << static_cast<uint16_t>(IsStruct) << "\n\t"
-     << ".long " << sizeof(RecordV1) << "\n\t"
+     << ".long " << sizeof(llvm::struct_layout_reloc::Record) << "\n\t"
      << ".quad 1b\n\t"
      << ".quad 2b\n\t"
      << ".quad 3b\n\t"
@@ -4859,7 +4889,9 @@ static Address emitStructLayoutRelocFieldStorage(CodeGenFunction &CGF,
      << ".long " << FieldSize << "\n\t"
      << ".long " << Field->getFieldIndex() << "\n\t"
      << ".long 2\n\t"
-     << ".long 0\n\t"
+     << ".short " << FieldType << "\n\t"
+     << ".short 0\n\t"
+     << ".quad 4b\n\t"
      << ".popsection";
 
   llvm::FunctionType *AsmTy =

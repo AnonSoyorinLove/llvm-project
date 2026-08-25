@@ -2920,6 +2920,7 @@ public:
   // Emit a relocatable struct type size for runtime allocation and copies.
   llvm::Value *EmitStructLayoutRelocTypeSize(QualType Type);
   llvm::Value *EmitStructLayoutRelocObjectSize(QualType Type);
+  llvm::Value *EmitStructLayoutRelocFieldSize(const FieldDecl *Field);
 
   /// hasVolatileMember - returns true if aggregate type has a volatile
   /// member.

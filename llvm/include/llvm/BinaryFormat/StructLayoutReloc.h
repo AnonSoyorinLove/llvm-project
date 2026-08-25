@@ -16,7 +16,7 @@ namespace llvm {
 namespace struct_layout_reloc {
 
 inline constexpr uint32_t RecordMagic = 0x53524c31; // SRL1
-inline constexpr uint16_t CurrentVersion = 1;
+inline constexpr uint16_t CurrentVersion = 2;
 
 enum class Kind : uint16_t {
   FieldOffsetCode = 1,
@@ -25,6 +25,8 @@ enum class Kind : uint16_t {
   TypeSizeData = 4,
   GlobalObjectLayout = 5,
   GlobalInitField = 6,
+  FieldSizeCode = 7,
+  FieldSizeData = 8,
 };
 
 enum class PatchKind : uint16_t {
@@ -38,12 +40,26 @@ enum Flags : uint16_t {
   IsStruct = 1U << 0,
 };
 
-/// Fixed-size record emitted into .llvm_struct_reloc.
+enum class FieldTypeKind : uint16_t {
+  None = 0,
+  Basic = 1,
+  Struct = 2,
+  Union = 3,
+  Array = 4,
+  Pointer = 5,
+  Enum = 6,
+  Function = 7,
+  Other = 8,
+};
+
+/// Fixed-size record emitted into .llvm_struct_reloc. Array bounds are
+/// intentionally omitted from FieldTypeName so a target array length may
+/// differ while its element type remains compatible.
 ///
-/// PatchSite, TypeName, and FieldName are populated through normal ELF
-/// relocations. A patcher can therefore resolve them in an ET_REL object
-/// without requiring a custom ELF relocation type.
-struct RecordV1 {
+/// PatchSite, TypeName, FieldName, and FieldTypeName are populated through
+/// normal ELF relocations. A patcher can therefore resolve them in an ET_REL
+/// object without requiring a custom ELF relocation type.
+struct Record {
   uint32_t Magic;
   uint16_t Version;
   uint16_t RelocKind;
@@ -58,12 +74,16 @@ struct RecordV1 {
   uint32_t CompiledFieldSize;
   uint32_t FieldIndex;
   uint32_t PatchInstructionCount;
-  uint32_t Reserved;
+  uint16_t FieldType;
+  uint16_t Reserved;
+  uint64_t FieldTypeName;
 };
 
-static_assert(sizeof(RecordV1) == 64, "unexpected struct relocation size");
-static_assert(offsetof(RecordV1, PatchSite) == 16,
+static_assert(sizeof(Record) == 72, "unexpected struct relocation size");
+static_assert(offsetof(Record, PatchSite) == 16,
               "unexpected patch-site offset");
+static_assert(offsetof(Record, FieldTypeName) == 64,
+              "unexpected field-type-name offset");
 
 } // namespace struct_layout_reloc
 } // namespace llvm

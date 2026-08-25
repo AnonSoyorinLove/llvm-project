@@ -751,6 +751,8 @@ public:
     const { return PreprocessorOpts; }
   const CodeGenOptions &getCodeGenOpts() const { return CodeGenOpts; }
   bool isStructLayoutRelocEnabledFor(const RecordDecl *Record) const;
+  std::pair<uint16_t, std::string>
+  getStructLayoutRelocFieldTypeInfo(QualType Type) const;
   llvm::Module &getModule() const { return TheModule; }
   DiagnosticsEngine &getDiags() const { return Diags; }
   const llvm::DataLayout &getDataLayout() const {

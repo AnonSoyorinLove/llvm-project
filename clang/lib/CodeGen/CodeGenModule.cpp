@@ -519,6 +519,79 @@ bool CodeGenModule::isStructLayoutRelocEnabledFor(
   return Selected;
 }
 
+static std::string getStructLayoutRelocTypeIdentity(ASTContext &Context,
+                                                    QualType Type) {
+  Type = Type.getCanonicalType().getUnqualifiedType();
+  if (const ArrayType *Array = Context.getAsArrayType(Type))
+    return "array:" +
+           getStructLayoutRelocTypeIdentity(Context, Array->getElementType());
+  if (const auto *Record = Type->getAs<RecordType>()) {
+    const RecordDecl *Decl = Record->getDecl();
+    return (Decl->isUnion() ? "union:" : "struct:") + Decl->getName().str();
+  }
+  if (const auto *Pointer = Type->getAs<PointerType>())
+    return "pointer:" +
+           getStructLayoutRelocTypeIdentity(Context, Pointer->getPointeeType());
+  if (const auto *Enum = Type->getAs<EnumType>())
+    return "enum:" + Enum->getDecl()->getName().str();
+  if (Type->isFunctionType())
+    return "function";
+  if (Type->isBuiltinType())
+    return "basic:" + Type.getAsString(Context.getPrintingPolicy());
+  return "other:" + Type.getAsString(Context.getPrintingPolicy());
+}
+
+std::pair<uint16_t, std::string>
+CodeGenModule::getStructLayoutRelocFieldTypeInfo(QualType Type) const {
+  using llvm::struct_layout_reloc::FieldTypeKind;
+
+  Type = Type.getCanonicalType().getUnqualifiedType();
+  FieldTypeKind Kind = FieldTypeKind::Other;
+  if (Context.getAsArrayType(Type))
+    Kind = FieldTypeKind::Array;
+  else if (const auto *Record = Type->getAs<RecordType>())
+    Kind = Record->getDecl()->isUnion() ? FieldTypeKind::Union
+                                        : FieldTypeKind::Struct;
+  else if (Type->isPointerType())
+    Kind = FieldTypeKind::Pointer;
+  else if (Type->isEnumeralType())
+    Kind = FieldTypeKind::Enum;
+  else if (Type->isFunctionType())
+    Kind = FieldTypeKind::Function;
+  else if (Type->isBuiltinType())
+    Kind = FieldTypeKind::Basic;
+
+  std::string Identity = getStructLayoutRelocTypeIdentity(Context, Type);
+  llvm::StringRef Prefix;
+  switch (Kind) {
+  case FieldTypeKind::Array:
+    Prefix = "array:";
+    break;
+  case FieldTypeKind::Struct:
+    Prefix = "struct:";
+    break;
+  case FieldTypeKind::Union:
+    Prefix = "union:";
+    break;
+  case FieldTypeKind::Pointer:
+    Prefix = "pointer:";
+    break;
+  case FieldTypeKind::Enum:
+    Prefix = "enum:";
+    break;
+  case FieldTypeKind::Basic:
+    Prefix = "basic:";
+    break;
+  case FieldTypeKind::Function:
+  case FieldTypeKind::Other:
+  case FieldTypeKind::None:
+    break;
+  }
+  if (!Prefix.empty() && llvm::StringRef(Identity).starts_with(Prefix))
+    Identity.erase(0, Prefix.size());
+  return {static_cast<uint16_t>(Kind), std::move(Identity)};
+}
+
 void CodeGenModule::createObjCRuntime() {
   // This is just isGNUFamily(), but we want to force implementors of
   // new ABIs to decide how best to do this.
@@ -5399,9 +5472,9 @@ static bool isStructLayoutRelocGlobalType(CodeGenModule &CGM, QualType Type,
 static void emitStructLayoutRelocGlobalData(
     CodeGenModule &CGM, llvm::GlobalVariable *GV,
     llvm::struct_layout_reloc::Kind RelocKind, const RecordDecl *Record,
-    llvm::StringRef FieldName, uint64_t CompiledTypeSize,
-    uint64_t CompiledFieldOffset, uint64_t CompiledFieldSize,
-    uint32_t FieldIndex) {
+    llvm::StringRef FieldName, QualType FieldQualType,
+    uint64_t CompiledTypeSize, uint64_t CompiledFieldOffset,
+    uint64_t CompiledFieldSize, uint32_t FieldIndex) {
   using namespace llvm::struct_layout_reloc;
 
   llvm::IntegerType *IntTy = dyn_cast<llvm::IntegerType>(GV->getValueType());
@@ -5417,6 +5490,13 @@ static void emitStructLayoutRelocGlobalData(
   const PatchKind Encoding = IntTy->getBitWidth() == 64
                                  ? PatchKind::AArch64DataU64
                                  : PatchKind::AArch64DataU32;
+  uint16_t FieldType = static_cast<uint16_t>(FieldTypeKind::None);
+  std::string FieldTypeName;
+  if (!FieldQualType.isNull()) {
+    auto TypeInfo = CGM.getStructLayoutRelocFieldTypeInfo(FieldQualType);
+    FieldType = TypeInfo.first;
+    FieldTypeName = std::move(TypeInfo.second);
+  }
   llvm::LLVMContext &Ctx = CGM.getLLVMContext();
   llvm::NamedMDNode *Relocs =
       CGM.getModule().getOrInsertNamedMetadata("llvm.struct.layout.reloc");
@@ -5434,6 +5514,7 @@ static void emitStructLayoutRelocGlobalData(
   OS << ".pushsection .llvm_struct_reloc.str,\"MS\",@progbits,1\n\t"
      << "2:\n\t.asciz \"" << Record->getName() << "\"\n\t"
      << "3:\n\t.asciz \"" << FieldName << "\"\n\t"
+     << "4:\n\t.asciz \"" << FieldTypeName << "\"\n\t"
      << ".popsection\n\t"
      << ".pushsection .llvm_struct_reloc,\"\",@progbits\n\t"
      << ".balign 8\n\t"
@@ -5442,7 +5523,7 @@ static void emitStructLayoutRelocGlobalData(
      << ".short " << static_cast<uint16_t>(RelocKind) << "\n\t"
      << ".short " << static_cast<uint16_t>(Encoding) << "\n\t"
      << ".short " << static_cast<uint16_t>(IsStruct) << "\n\t"
-     << ".long " << sizeof(RecordV1) << "\n\t"
+     << ".long " << sizeof(llvm::struct_layout_reloc::Record) << "\n\t"
      << ".quad " << GV->getName() << "\n\t"
      << ".quad 2b\n\t"
      << ".quad 3b\n\t"
@@ -5451,7 +5532,9 @@ static void emitStructLayoutRelocGlobalData(
      << ".long " << CompiledFieldSize << "\n\t"
      << ".long " << FieldIndex << "\n\t"
      << ".long 0\n\t"
-     << ".long 0\n\t"
+     << ".short " << FieldType << "\n\t"
+     << ".short 0\n\t"
+     << ".quad 4b\n\t"
      << ".popsection";
   CGM.getModule().appendModuleInlineAsm(OS.str());
 }
@@ -5460,9 +5543,9 @@ static void emitStructLayoutRelocGlobalData(
 static void emitStructLayoutRelocGlobalRecord(
     CodeGenModule &CGM, llvm::GlobalVariable *GV,
     llvm::struct_layout_reloc::Kind RelocKind, const RecordDecl *Record,
-    llvm::StringRef FieldName, uint64_t CompiledTypeSize,
-    uint64_t CompiledFieldOffset, uint64_t CompiledFieldSize,
-    uint32_t FieldIndex) {
+    llvm::StringRef FieldName, QualType FieldQualType,
+    uint64_t CompiledTypeSize, uint64_t CompiledFieldOffset,
+    uint64_t CompiledFieldSize, uint32_t FieldIndex) {
   using namespace llvm::struct_layout_reloc;
 
   if (!llvm::isUInt<32>(CompiledTypeSize) ||
@@ -5470,11 +5553,20 @@ static void emitStructLayoutRelocGlobalRecord(
       !llvm::isUInt<32>(CompiledFieldSize))
     return;
 
+  uint16_t FieldType = static_cast<uint16_t>(FieldTypeKind::None);
+  std::string FieldTypeName;
+  if (!FieldQualType.isNull()) {
+    auto TypeInfo = CGM.getStructLayoutRelocFieldTypeInfo(FieldQualType);
+    FieldType = TypeInfo.first;
+    FieldTypeName = std::move(TypeInfo.second);
+  }
+
   std::string Asm;
   llvm::raw_string_ostream OS(Asm);
   OS << ".pushsection .llvm_struct_reloc.str,\"MS\",@progbits,1\n\t"
      << "2:\n\t.asciz \"" << Record->getName() << "\"\n\t"
      << "3:\n\t.asciz \"" << FieldName << "\"\n\t"
+     << "4:\n\t.asciz \"" << FieldTypeName << "\"\n\t"
      << ".popsection\n\t"
      << ".pushsection .llvm_struct_reloc,\"\",@progbits\n\t"
      << ".balign 8\n\t"
@@ -5483,7 +5575,7 @@ static void emitStructLayoutRelocGlobalRecord(
      << ".short " << static_cast<uint16_t>(RelocKind) << "\n\t"
      << ".short " << static_cast<uint16_t>(PatchKind::None) << "\n\t"
      << ".short " << static_cast<uint16_t>(IsStruct) << "\n\t"
-     << ".long " << sizeof(RecordV1) << "\n\t"
+     << ".long " << sizeof(llvm::struct_layout_reloc::Record) << "\n\t"
      << ".quad " << GV->getName() << "\n\t"
      << ".quad 2b\n\t"
      << ".quad 3b\n\t"
@@ -5492,7 +5584,9 @@ static void emitStructLayoutRelocGlobalRecord(
      << ".long " << CompiledFieldSize << "\n\t"
      << ".long " << FieldIndex << "\n\t"
      << ".long 0\n\t"
-     << ".long 0\n\t"
+     << ".short " << FieldType << "\n\t"
+     << ".short 0\n\t"
+     << ".quad 4b\n\t"
      << ".popsection";
   CGM.getModule().appendModuleInlineAsm(OS.str());
 }
@@ -5535,7 +5629,7 @@ static void maybeEmitStructLayoutRelocGlobalObject(CodeGenModule &CGM,
 
   emitStructLayoutRelocGlobalRecord(
       CGM, GV, llvm::struct_layout_reloc::Kind::GlobalObjectLayout, Record,
-      "<object>", CompiledSize, CapacitySize, 0, 0);
+      "<object>", QualType(), CompiledSize, CapacitySize, 0, 0);
 
   const ASTRecordLayout &Layout = CGM.getContext().getASTRecordLayout(Record);
   for (const FieldDecl *Field : Record->fields()) {
@@ -5543,11 +5637,12 @@ static void maybeEmitStructLayoutRelocGlobalObject(CodeGenModule &CGM,
       continue;
     uint64_t Offset = Layout.getFieldOffset(Field->getFieldIndex()) /
                       CGM.getContext().getCharWidth();
-    uint64_t Size = CGM.getContext().getTypeSizeInChars(Field->getType())
-                        .getQuantity();
+    uint64_t Size =
+        CGM.getContext().getTypeSizeInChars(Field->getType()).getQuantity();
     emitStructLayoutRelocGlobalRecord(
         CGM, GV, llvm::struct_layout_reloc::Kind::GlobalInitField, Record,
-        Field->getName(), CompiledSize, Offset, Size, Field->getFieldIndex());
+        Field->getName(), Field->getType(), CompiledSize, Offset, Size,
+        Field->getFieldIndex());
   }
 }
 
@@ -5558,45 +5653,71 @@ static void maybeEmitStructLayoutRelocGlobalData(CodeGenModule &CGM,
       CGM.getLangOpts().CPlusPlus)
     return;
 
-  const Expr *Expr = InitExpr->IgnoreParenImpCasts();
+  const Expr *Initializer = InitExpr->IgnoreParenImpCasts();
   using namespace llvm::struct_layout_reloc;
-  if (const auto *Offset = dyn_cast<OffsetOfExpr>(Expr)) {
+  if (const auto *Offset = dyn_cast<OffsetOfExpr>(Initializer)) {
     if (Offset->getNumComponents() != 1 ||
         Offset->getComponent(0).getKind() != OffsetOfNode::Field)
       return;
     FieldDecl *Field = Offset->getComponent(0).getField();
     const RecordDecl *Record = nullptr;
-    if (!isStructLayoutRelocGlobalType(CGM,
-                                       Offset->getTypeSourceInfo()->getType(),
-                                       &Record) ||
+    if (!isStructLayoutRelocGlobalType(
+            CGM, Offset->getTypeSourceInfo()->getType(), &Record) ||
         Field->getParent() != Record)
       return;
-    const ASTRecordLayout &Layout =
-        CGM.getContext().getASTRecordLayout(Record);
+    const ASTRecordLayout &Layout = CGM.getContext().getASTRecordLayout(Record);
     uint64_t TypeSize = Layout.getSize().getQuantity();
-    uint64_t FieldOffset =
-        Layout.getFieldOffset(Field->getFieldIndex()) /
-        CGM.getContext().getCharWidth();
+    uint64_t FieldOffset = Layout.getFieldOffset(Field->getFieldIndex()) /
+                           CGM.getContext().getCharWidth();
     uint64_t FieldSize =
         CGM.getContext().getTypeSizeInChars(Field->getType()).getQuantity();
-    emitStructLayoutRelocGlobalData(
-        CGM, GV, Kind::FieldOffsetData, Record, Field->getName(), TypeSize,
-        FieldOffset, FieldSize, Field->getFieldIndex());
+    emitStructLayoutRelocGlobalData(CGM, GV, Kind::FieldOffsetData, Record,
+                                    Field->getName(), Field->getType(),
+                                    TypeSize, FieldOffset, FieldSize,
+                                    Field->getFieldIndex());
     return;
   }
 
-  const auto *Trait = dyn_cast<UnaryExprOrTypeTraitExpr>(Expr);
-  if (!Trait || (Trait->getKind() != UETT_SizeOf &&
-                 Trait->getKind() != UETT_DataSizeOf))
+  const auto *Trait = dyn_cast<UnaryExprOrTypeTraitExpr>(Initializer);
+  if (!Trait ||
+      (Trait->getKind() != UETT_SizeOf && Trait->getKind() != UETT_DataSizeOf))
     return;
+  if (!Trait->isArgumentType()) {
+    const Expr *Argument = Trait->getArgumentExpr()->IgnoreParenImpCasts();
+    const auto *Member = dyn_cast<MemberExpr>(Argument);
+    const auto *Field =
+        Member ? dyn_cast<FieldDecl>(Member->getMemberDecl()) : nullptr;
+    if (Field && Field->getIdentifier() &&
+        !Field->getType()->isIncompleteType()) {
+      const RecordDecl *Record = Field->getParent();
+      if (CGM.isStructLayoutRelocEnabledFor(Record)) {
+        Record = Record->getDefinition();
+        if (Field->getParent() == Record) {
+          const ASTRecordLayout &Layout =
+              CGM.getContext().getASTRecordLayout(Record);
+          uint64_t TypeSize = Layout.getSize().getQuantity();
+          uint64_t FieldOffset = Layout.getFieldOffset(Field->getFieldIndex()) /
+                                 CGM.getContext().getCharWidth();
+          uint64_t FieldSize = CGM.getContext()
+                                   .getTypeSizeInChars(Field->getType())
+                                   .getQuantity();
+          emitStructLayoutRelocGlobalData(CGM, GV, Kind::FieldSizeData, Record,
+                                          Field->getName(), Field->getType(),
+                                          TypeSize, FieldOffset, FieldSize,
+                                          Field->getFieldIndex());
+          return;
+        }
+      }
+    }
+  }
+
   const RecordDecl *Record = nullptr;
-  if (!isStructLayoutRelocGlobalType(CGM, Trait->getTypeOfArgument(),
-                                     &Record))
+  if (!isStructLayoutRelocGlobalType(CGM, Trait->getTypeOfArgument(), &Record))
     return;
   uint64_t TypeSize =
       CGM.getContext().getASTRecordLayout(Record).getSize().getQuantity();
   emitStructLayoutRelocGlobalData(CGM, GV, Kind::TypeSizeData, Record,
-                                  "<type-size>", TypeSize, 0, 0, 0);
+                                  "<type-size>", QualType(), TypeSize, 0, 0, 0);
 }
 
 /// Pass IsTentative as true if you want to create a tentative definition.

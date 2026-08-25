@@ -89,7 +89,7 @@ bool shouldEmitStructLayoutRelocValue(CodeGenFunction &CGF, QualType Type,
 
 llvm::Value *emitStructLayoutRelocValue(
     CodeGenFunction &CGF, llvm::struct_layout_reloc::Kind RelocKind,
-    const RecordDecl *Record, llvm::StringRef FieldName,
+    const RecordDecl *Record, llvm::StringRef FieldName, QualType FieldQualType,
     uint64_t CompiledTypeSize, uint64_t CompiledFieldOffset,
     uint64_t CompiledFieldSize, uint32_t FieldIndex) {
   using namespace llvm::struct_layout_reloc;
@@ -113,9 +113,19 @@ llvm::Value *emitStructLayoutRelocValue(
             llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
                 llvm::Type::getInt32Ty(Ctx), CompiledFieldSize))}));
 
-  const uint32_t Value = RelocKind == Kind::TypeSizeCode
-                             ? static_cast<uint32_t>(CompiledTypeSize)
-                             : static_cast<uint32_t>(CompiledFieldOffset);
+  uint16_t FieldType = static_cast<uint16_t>(FieldTypeKind::None);
+  std::string FieldTypeName;
+  if (!FieldQualType.isNull()) {
+    auto TypeInfo = CGF.CGM.getStructLayoutRelocFieldTypeInfo(FieldQualType);
+    FieldType = TypeInfo.first;
+    FieldTypeName = std::move(TypeInfo.second);
+  }
+
+  uint32_t Value = static_cast<uint32_t>(CompiledFieldOffset);
+  if (RelocKind == Kind::TypeSizeCode)
+    Value = static_cast<uint32_t>(CompiledTypeSize);
+  else if (RelocKind == Kind::FieldSizeCode)
+    Value = static_cast<uint32_t>(CompiledFieldSize);
   const uint32_t Low = Value & 0xffffU;
   const uint32_t High = Value >> 16;
   std::string Asm;
@@ -126,16 +136,16 @@ llvm::Value *emitStructLayoutRelocValue(
      << ".pushsection .llvm_struct_reloc.str,\"MS\",@progbits,1\n\t"
      << "2:\n\t.asciz \"" << Record->getName() << "\"\n\t"
      << "3:\n\t.asciz \"" << FieldName << "\"\n\t"
+     << "4:\n\t.asciz \"" << FieldTypeName << "\"\n\t"
      << ".popsection\n\t"
      << ".pushsection .llvm_struct_reloc,\"\",@progbits\n\t"
      << ".balign 8\n\t"
      << ".long " << RecordMagic << "\n\t"
      << ".short " << CurrentVersion << "\n\t"
      << ".short " << static_cast<uint16_t>(RelocKind) << "\n\t"
-     << ".short " << static_cast<uint16_t>(PatchKind::AArch64MovwU32)
-     << "\n\t"
+     << ".short " << static_cast<uint16_t>(PatchKind::AArch64MovwU32) << "\n\t"
      << ".short " << static_cast<uint16_t>(IsStruct) << "\n\t"
-     << ".long " << sizeof(RecordV1) << "\n\t"
+     << ".long " << sizeof(llvm::struct_layout_reloc::Record) << "\n\t"
      << ".quad 1b\n\t"
      << ".quad 2b\n\t"
      << ".quad 3b\n\t"
@@ -144,7 +154,9 @@ llvm::Value *emitStructLayoutRelocValue(
      << ".long " << CompiledFieldSize << "\n\t"
      << ".long " << FieldIndex << "\n\t"
      << ".long 2\n\t"
-     << ".long 0\n\t"
+     << ".short " << FieldType << "\n\t"
+     << ".short 0\n\t"
+     << ".quad 4b\n\t"
      << ".popsection";
 
   llvm::FunctionType *AsmTy =
@@ -177,7 +189,22 @@ llvm::Value *tryEmitStructLayoutRelocOffsetOf(CodeGenFunction &CGF,
       CGF.getContext().getTypeSizeInChars(Field->getType()).getQuantity();
   return emitStructLayoutRelocValue(
       CGF, llvm::struct_layout_reloc::Kind::FieldOffsetCode, Record,
-      Field->getName(), TypeSize, Offset, FieldSize, Field->getFieldIndex());
+      Field->getName(), Field->getType(), TypeSize, Offset, FieldSize,
+      Field->getFieldIndex());
+}
+
+llvm::Value *
+tryEmitStructLayoutRelocFieldSize(CodeGenFunction &CGF,
+                                  const UnaryExprOrTypeTraitExpr *E) {
+  if (E->isArgumentType())
+    return nullptr;
+  const Expr *Argument = E->getArgumentExpr()->IgnoreParenImpCasts();
+  const auto *Member = dyn_cast<MemberExpr>(Argument);
+  const auto *Field =
+      Member ? dyn_cast<FieldDecl>(Member->getMemberDecl()) : nullptr;
+  if (!Field || !Field->getIdentifier() || Field->getType()->isIncompleteType())
+    return nullptr;
+  return CGF.EmitStructLayoutRelocFieldSize(Field);
 }
 
 llvm::Value *tryEmitStructLayoutRelocTypeSize(CodeGenFunction &CGF,
@@ -189,8 +216,8 @@ llvm::Value *tryEmitStructLayoutRelocTypeSize(CodeGenFunction &CGF,
   const ASTRecordLayout &Layout = CGF.getContext().getASTRecordLayout(Record);
   uint64_t TypeSize = Layout.getSize().getQuantity();
   return emitStructLayoutRelocValue(
-      CGF, llvm::struct_layout_reloc::Kind::TypeSizeCode, Record,
-      "<type-size>", TypeSize, 0, 0, 0);
+      CGF, llvm::struct_layout_reloc::Kind::TypeSizeCode, Record, "<type-size>",
+      QualType(), TypeSize, 0, 0, 0);
 }
 
 bool mayHaveIntegerOverflow(llvm::ConstantInt *LHS, llvm::ConstantInt *RHS,
@@ -1081,6 +1108,30 @@ llvm::Value *CodeGenFunction::EmitStructLayoutRelocObjectSize(QualType Type) {
   return Builder.CreateNUWMul(Size, Count, "struct.layout.reloc.object.size");
 }
 
+llvm::Value *
+CodeGenFunction::EmitStructLayoutRelocFieldSize(const FieldDecl *Field) {
+  if (SuppressStructLayoutReloc || !Field || !Field->getIdentifier() ||
+      Field->getType()->isIncompleteType())
+    return nullptr;
+
+  const RecordDecl *Record = Field->getParent();
+  if (!CGM.isStructLayoutRelocEnabledFor(Record))
+    return nullptr;
+  Record = Record->getDefinition();
+  if (Field->getParent() != Record)
+    return nullptr;
+
+  const ASTRecordLayout &Layout = getContext().getASTRecordLayout(Record);
+  uint64_t Offset = Layout.getFieldOffset(Field->getFieldIndex()) /
+                    getContext().getCharWidth();
+  uint64_t TypeSize = Layout.getSize().getQuantity();
+  uint64_t FieldSize =
+      getContext().getTypeSizeInChars(Field->getType()).getQuantity();
+  return emitStructLayoutRelocValue(
+      *this, llvm::struct_layout_reloc::Kind::FieldSizeCode, Record,
+      Field->getName(), Field->getType(), TypeSize, Offset, FieldSize,
+      Field->getFieldIndex());
+}
 
 //===----------------------------------------------------------------------===//
 //                                Utilities
@@ -3478,6 +3529,9 @@ ScalarExprEmitter::VisitUnaryExprOrTypeTraitExpr(
 
       return size;
     }
+
+    if (llvm::Value *RelocValue = tryEmitStructLayoutRelocFieldSize(CGF, E))
+      return RelocValue;
 
     if (llvm::Value *RelocValue =
             CGF.EmitStructLayoutRelocObjectSize(TypeToSize))
