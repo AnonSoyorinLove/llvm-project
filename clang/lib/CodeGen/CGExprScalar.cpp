@@ -2131,15 +2131,22 @@ Value *ScalarExprEmitter::VisitConvertVectorExpr(ConvertVectorExpr *E) {
 }
 
 Value *ScalarExprEmitter::VisitMemberExpr(MemberExpr *E) {
-  if (CodeGenFunction::ConstantEmission Constant = CGF.tryEmitAsConstant(E)) {
-    CGF.EmitIgnoredExpr(E->getBase());
-    return CGF.emitScalarConstant(Constant, E);
-  } else {
-    Expr::EvalResult Result;
-    if (E->EvaluateAsInt(Result, CGF.getContext(), Expr::SE_AllowSideEffects)) {
-      llvm::APSInt Value = Result.Val.getInt();
+  const auto *Field = dyn_cast<FieldDecl>(E->getMemberDecl());
+  bool RelocatableField =
+      Field && Field->getIdentifier() && !CGF.SuppressStructLayoutReloc &&
+      CGF.CGM.isStructLayoutRelocEnabledFor(Field->getParent());
+  if (!RelocatableField) {
+    if (CodeGenFunction::ConstantEmission Constant = CGF.tryEmitAsConstant(E)) {
       CGF.EmitIgnoredExpr(E->getBase());
-      return Builder.getInt(Value);
+      return CGF.emitScalarConstant(Constant, E);
+    } else {
+      Expr::EvalResult Result;
+      if (E->EvaluateAsInt(Result, CGF.getContext(),
+                           Expr::SE_AllowSideEffects)) {
+        llvm::APSInt Value = Result.Val.getInt();
+        CGF.EmitIgnoredExpr(E->getBase());
+        return Builder.getInt(Value);
+      }
     }
   }
 

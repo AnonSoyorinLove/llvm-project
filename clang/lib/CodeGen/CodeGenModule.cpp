@@ -5903,6 +5903,14 @@ void CodeGenModule::EmitGlobalVarDefinition(const VarDecl *D,
   maybeEmitStructLayoutRelocGlobalObject(*this, GV, RelocGlobalRecord,
                                          RelocGlobalCompiledSize,
                                          RelocGlobalCapacitySize);
+  if (RelocGlobalRecord) {
+    // The relocation records refer to GV from module inline assembly, which
+    // does not form an IR use. Keep the definition alive and prevent its
+    // initializer from being folded into uses before the external patcher can
+    // rewrite the object.
+    GV->setExternallyInitialized(true);
+    addCompilerUsedGlobal(GV);
+  }
   maybeEmitStructLayoutRelocGlobalData(*this, GV, InitExpr);
   if (emitter)
     emitter->finalize(GV);

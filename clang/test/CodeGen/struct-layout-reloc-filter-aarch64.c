@@ -50,7 +50,7 @@ void stack_other(void) {
 }
 
 // PREFIX: %prefix_one.reloc = type { %struct.prefix_one, [32 x i8] }
-// PREFIX: @global_one = global %prefix_one.reloc
+// PREFIX: @global_one = externally_initialized global %prefix_one.reloc
 // PREFIX: @global_other = global %struct.prefix_other
 
 // PREFIX-LABEL: define{{.*}} i32 @load_one(
@@ -73,7 +73,7 @@ void stack_other(void) {
 // PREFIX: alloca %struct.prefix_other
 
 // CONFIG: %prefix_one.reloc = type { %struct.prefix_one, [32 x i8] }
-// CONFIG: @global_one = global %prefix_one.reloc
+// CONFIG: @global_one = externally_initialized global %prefix_one.reloc
 // CONFIG: @global_other = global %struct.prefix_other
 
 // CONFIG-LABEL: define{{.*}} i32 @load_one(
