@@ -5601,9 +5601,21 @@ static bool isStructLayoutRelocGlobalDecl(CodeGenModule &CGM,
 
 static llvm::Constant *extendStructLayoutRelocGlobalInitializer(
     CodeGenModule &CGM, llvm::Constant *Init, const RecordDecl *Record,
-    uint64_t &CompiledSize, uint64_t &CapacitySize) {
+    const VarDecl *D, uint64_t &CompiledSize, uint64_t &CapacitySize) {
   llvm::Type *InitType = Init->getType();
   CompiledSize = CGM.getDataLayout().getTypeAllocSize(InitType);
+
+  // The kernel loader treats __param as an array of struct kernel_param and
+  // walks it with sizeof(struct kernel_param), so adding per-object tail
+  // storage would change the stride and make every subsequent parameter
+  // unreadable. Keep these objects at their ABI size while still emitting the
+  // normal field relocation records below.
+  if (const auto *Section = D->getAttr<SectionAttr>())
+    if (Section->getName() == "__param") {
+      CapacitySize = CompiledSize;
+      return Init;
+    }
+
   CapacitySize = llvm::alignTo(
       CompiledSize + CGM.getCodeGenOpts().StructLayoutRelocGlobalExtraBytes,
       CGM.getDataLayout().getABITypeAlign(InitType).value());
@@ -5827,7 +5839,7 @@ void CodeGenModule::EmitGlobalVarDefinition(const VarDecl *D,
   uint64_t RelocGlobalCapacitySize = 0;
   if (isStructLayoutRelocGlobalDecl(*this, D, &RelocGlobalRecord))
     Init = extendStructLayoutRelocGlobalInitializer(
-        *this, Init, RelocGlobalRecord, RelocGlobalCompiledSize,
+        *this, Init, RelocGlobalRecord, D, RelocGlobalCompiledSize,
         RelocGlobalCapacitySize);
 
   llvm::Type *InitType = Init->getType();
